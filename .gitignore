@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Local configuration and runtime data (never commit credentials or scraped content)
+.env
+webapp/data/
+Scraped_Data/
+india_gov_in/
+nhm_gov_in/
+*_deduped/
+*_full/
+*.log
+
+# Course / scratch material not needed by the tool
+Web_Scraping/
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

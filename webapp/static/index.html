@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scraping Web App</title>
+<link rel="stylesheet" href="/static/style.css?v=20261120b">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <div>
+      <h1>Scraping Web App</h1>
+      <p id="disk-info" class="muted">loading…</p>
+    </div>
+  </div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="scrape">Scrape</button>
+    <button class="tab" data-tab="live">Live scraping</button>
+    <button class="tab" data-tab="jobs">Jobs <span id="job-count" class="pill">0</span></button>
+    <button class="tab" data-tab="dedupe">De-dupe</button>
+  </nav>
+</header>
+
+<main>
+
+  <!-- ================= SCRAPE ================= -->
+  <section id="tab-scrape" class="panel active">
+
+    <div class="card">
+      <div class="row-between">
+        <label class="field-label" for="scrape-url">Website URL</label>
+        <select id="scrape-existing" class="mini">
+          <option value="">Continue an already-scraped site…</option>
+        </select>
+      </div>
+      <input id="scrape-url" class="url-input" type="url"
+             placeholder="https://www.example.gov.in/" autocomplete="off">
+      <p class="hint">A new URL creates its own folder, named after the domain.</p>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Storage folder</h2>
+        <span id="scrape-storage-badge" class="badge">not checked</span>
+      </div>
+      <p class="hint">The whole website folder is created inside this folder:
+        <code>&lt;folder&gt;\Scraped_Data\&lt;website_name&gt;</code>. Enter an
+        existing folder and click Check.</p>
+      <div class="storage-row">
+        <input id="scrape-storage-path" type="text"
+               placeholder="C:\Users\you\Desktop\web_scraping"
+               autocomplete="off" spellcheck="false">
+        <button id="scrape-storage-check" class="ghost">Check</button>
+      </div>
+      <p id="scrape-storage-msg" class="hint"></p>
+      <p id="scrape-storage-preview" class="hint"></p>
+    </div>
+
+    <div class="card" id="global-proxy-card">
+      <div class="row-between">
+        <h2>Proxy rotation (all jobs)</h2>
+        <span id="global-proxy-badge" class="badge">direct connection</span>
+      </div>
+      <p class="hint">Leave the list empty to use the computer's real IP. Paste one
+        proxy per line (for example <code>http://user:pass@1.2.3.4:8080</code>) to
+        use it for every new job. Credentials are hidden in logs and job commands.</p>
+      <p id="global-proxy-current" class="hint"></p>
+      <textarea id="global-proxy-list" rows="3" spellcheck="false"
+        placeholder="Paste proxies here, one per line. Leave empty to keep the current list."></textarea>
+      <div class="storage-row">
+        <select id="global-proxy-mode">
+          <option value="rotate_on_block">Rotate when blocked (recommended)</option>
+          <option value="rotate_per_page">Rotate on every page</option>
+          <option value="sticky">Sticky - one proxy for the whole job</option>
+        </select>
+        <button id="global-proxy-save" class="ghost">Save</button>
+        <button id="global-proxy-test" class="ghost">Test</button>
+        <button id="global-proxy-clear" class="ghost">Clear list</button>
+      </div>
+      <p id="global-proxy-msg" class="hint"></p>
+    </div>
+
+    <div class="card">
+      <h2>What to collect</h2>
+      <p class="hint">Toggles decide what is <b>downloaded</b>. The JSON always keeps
+        every link the crawler finds — turn Images off and you still get the image
+        URLs, just no image files. Click a format chip (for example <b>svg</b>) to
+        include or exclude that file type; only the active chips are downloaded.
+        Only the Text toggle changes the JSON (it drops the page body).</p>
+      <div id="scrape-types" class="type-grid"></div>
+    </div>
+
+    <div class="card">
+      <h2>Crawl mode</h2>
+      <div id="scrape-modes" class="mode-grid"></div>
+      <p class="hint">Pick <b>Internal</b> for your own site (all menus and the pages
+        inside them), <b>External</b> for only the other websites it links to, or
+        <b>Full</b> for both. Your toggles decide what is downloaded; links are
+        always kept in the JSON.</p>
+    </div>
+
+    <div class="card">
+      <div class="type-head">
+        <div>
+          <h2>Re-check stored pages</h2>
+          <p class="hint">Fetches pages that are already saved and rewrites only the ones
+            whose title, text or file list changed. Off = only new pages are crawled.</p>
+        </div>
+        <label class="switch"><input type="checkbox" id="scrape-refresh-on"><span class="slider"></span></label>
+      </div>
+      <div id="scrape-refresh" class="limits hidden"></div>
+    </div>
+
+    <details class="card">
+      <summary>Advanced limits</summary>
+      <div id="scrape-limits" class="limits"></div>
+    </details>
+
+    <div class="card">
+      <h2>JSON format</h2>
+      <p class="hint">Paste one sample object. Every scraped page is written in that shape.
+        Use field names or <code>{{source_url}}</code> style tokens.</p>
+      <textarea id="scrape-template" class="code" spellcheck="false" rows="9"></textarea>
+      <div class="row">
+        <button id="scrape-preview" class="ghost">Preview with sample data</button>
+      </div>
+      <pre id="scrape-preview-out" class="preview hidden"></pre>
+    </div>
+
+    <div class="actions">
+      <button id="scrape-start" class="primary big">Start scraping</button>
+    </div>
+  </section>
+
+  <!-- ================= LIVE ================= -->
+  <section id="tab-live" class="panel">
+
+    <div class="card">
+      <label class="field-label" for="live-url">Website URL</label>
+      <input id="live-url" class="url-input" type="url"
+             placeholder="https://www.example.gov.in/" autocomplete="off">
+      <div class="grid-3">
+        <div>
+          <label class="field-label" for="live-start">Start watching from</label>
+          <input id="live-start" type="date">
+        </div>
+        <div>
+          <label class="field-label" for="live-end">End date (optional)</label>
+          <input id="live-end" type="date">
+          <p class="hint">Leave empty to watch forever.</p>
+        </div>
+        <div>
+          <label class="field-label" for="live-interval">Check every (minutes)</label>
+          <input id="live-interval" type="number" min="1" value="30">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Storage folder</h2>
+        <span id="live-storage-badge" class="badge">not checked</span>
+      </div>
+      <p class="hint">Live jobs use the same storage folder as normal scrapes:
+        <code>&lt;folder&gt;\Scraped_Data\&lt;website_name&gt;</code>.</p>
+      <div class="storage-row">
+        <input id="live-storage-path" type="text"
+               placeholder="C:\Users\you\Desktop\web_scraping"
+               autocomplete="off" spellcheck="false">
+        <button id="live-storage-check" class="ghost">Check</button>
+      </div>
+      <p id="live-storage-msg" class="hint"></p>
+      <p id="live-storage-preview" class="hint"></p>
+      <p class="hint">Proxy rotation uses the global list on the Scrape tab, unless
+        you set a per-job override under Advanced limits.</p>
+    </div>
+
+    <div class="card">
+      <h2>What to collect</h2>
+      <p class="hint">Toggles decide what is <b>downloaded</b>. The JSON always keeps
+        every link — only the Text toggle changes the JSON.</p>
+      <div id="live-types" class="type-grid"></div>
+    </div>
+
+    <div class="card">
+      <h2>Crawl mode</h2>
+      <div id="live-modes" class="mode-grid"></div>
+      <p class="hint">Pick <b>Internal</b> for your own site, <b>External</b> for
+        only the other websites it links to, or <b>Full</b> for both. External
+        never stores your own pages.</p>
+    </div>
+
+    <div class="card">
+      <div class="type-head">
+        <div>
+          <h2>Re-check stored pages</h2>
+          <p class="hint">Each watch cycle also re-reads pages that are already saved and
+            updates the ones that changed. This is how edited articles are caught.</p>
+        </div>
+        <label class="switch"><input type="checkbox" id="live-refresh-on"><span class="slider"></span></label>
+      </div>
+      <div id="live-refresh" class="limits hidden"></div>
+    </div>
+
+    <details class="card">
+      <summary>Advanced limits</summary>
+      <div id="live-limits" class="limits"></div>
+    </details>
+
+    <div class="card">
+      <h2>JSON format</h2>
+      <textarea id="live-template" class="code" spellcheck="false" rows="7"></textarea>
+      <div class="row">
+        <button id="live-preview" class="ghost">Preview with sample data</button>
+      </div>
+      <pre id="live-preview-out" class="preview hidden"></pre>
+    </div>
+
+    <div class="actions">
+      <button id="live-start-btn" class="primary big">Start live watching</button>
+    </div>
+  </section>
+
+  <!-- ================= JOBS ================= -->
+  <section id="tab-jobs" class="panel">
+    <div class="jobs-head">
+      <div>
+        <h2>Jobs</h2>
+        <p class="hint">Running jobs appear first. A stopped or failed job keeps its saved place — press <b>Resume</b> to continue from the next page.</p>
+      </div>
+      <button id="refresh-jobs" class="ghost">Refresh</button>
+    </div>
+    <div id="jobs-summary" class="jobs-summary"></div>
+    <div id="jobs-list" class="jobs-list"></div>
+    <p id="jobs-empty" class="muted hidden">No jobs yet. Start one from the Scrape tab.</p>
+  </section>
+
+  <!-- ================= DE-DUPE ================= -->
+  <section id="tab-dedupe" class="panel">
+    <div class="card">
+      <h2>De-dupe finished websites</h2>
+      <p class="hint">When a scrape is stopped or finished, the site appears here with a
+        <b>De-dupe</b> button. Enter the <b>parent folder</b> where the copy should be saved
+        (for example <code>C:\Deduped</code>) — the app creates
+        <code>&lt;folder&gt;\&lt;site&gt;_deduped</code> there.</p>
+      <p class="hint">Your original <code>Scraped_Data\&lt;site&gt;</code> folder is
+        <b>never changed</b>. You can hand over the original (without de-dupe) or the
+        separate de-duped copy. A manifest records every original file, so
+        <b>Restore full</b> can rebuild the non-de-duplicated version later.</p>
+      <div class="row-between">
+        <span id="dedupe-count" class="muted">loading…</span>
+        <button id="refresh-dedupe" class="ghost">Refresh</button>
+      </div>
+    </div>
+    <div id="dedupe-list" class="dedupe-list"></div>
+    <p id="dedupe-empty" class="muted hidden">No finished websites yet. Stop or complete a scrape first.</p>
+  </section>
+
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="modal-title">Log</h3>
+      <button id="modal-close" class="ghost">Close</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=20261120b"></script>
+</body>
+</html>
