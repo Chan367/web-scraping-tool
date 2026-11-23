@@ -2,8 +2,8 @@
 
 Every scrape is delivered under ``Scraped_Data/<website_name>/``:
 
-    categories/<category>/           the ONLY copy of pages, HTML and media
-        html/  media/  pages.jsonl
+    categories/<category>/           the ONLY copy of pages and media
+        media/  pages.jsonl
     Json/Overall.json                the JSON viewer file
     Json/master.json                 every record, unchanged
     website_info.json
@@ -19,7 +19,6 @@ folder chosen by the user (see ``dedupe.py``).
 from __future__ import annotations
 
 import hashlib
-import html as html_lib
 import json
 import re
 import shutil
@@ -78,7 +77,7 @@ BUCKET_KEYWORDS = {
 
 HASH_CACHE = "hash_cache.json"
 # Only these folders are part of the packaged output.  categories/ is the
-# crawler's raw (and only) store of pages, HTML and media; Json/ holds the two
+# crawler's raw (and only) store of pages and media; Json/ holds the two
 # generated JSON files.  The old delivery roots are never written again.
 OUTPUT_ROOTS = ("categories", "Json")
 LEGACY_OUTPUT_ROOTS = ("Internal_Pages", "External_Pages")
@@ -257,7 +256,7 @@ def _website_name(url: str) -> str:
 
 
 # Windows refuses paths over 260 characters unless long-path support is turned
-# on. Keep a little headroom so child files (Links/, HTML/, media) still fit.
+# on. Keep a little headroom so child files (media) still fit.
 MAX_PATH = 240
 
 
@@ -394,36 +393,13 @@ def _internal_folder(record: dict, delivery: Path | None = None) -> tuple[str, s
     limit = 80
     if delivery is not None:
         # Path is <delivery>/Internal_Pages/Other_Categories/<slug>/<slug>.json
-        # and the folder also holds Links/ and HTML/ files.
+        # and the folder also holds its child files.
         base = str(delivery / "Internal_Pages" / OTHER_BUCKET)
         for_children = MAX_PATH - len(base) - 29
         for_json = (MAX_PATH - len(base) - 7) // 2
         limit = max(16, min(80, for_children, for_json))
     slug = _slug(category, limit)
     return f"{OTHER_BUCKET}/{slug}", f"{slug}.json"
-
-
-def _json_record(record: dict, text_on: bool, html_rel: str = "") -> dict:
-    return {
-        "prid": record.get("prid", ""),
-        "title": record.get("title", ""),
-        "text": record.get("text", "") if text_on else "",
-        "date_time": record.get("date_time", ""),
-        "source_url": record.get("source_url", ""),
-        "website_name": _website_name(record.get("source_url", "")),
-        "category": record.get("category", ""),
-        "categories": record.get("categories") or [],
-        "section": record.get("section", ""),
-        "image_url": record.get("image_url") or [],
-        "pdf_files": record.get("pdf_files") or [],
-        "audio_files": record.get("audio_files") or [],
-        "video_files": record.get("video_files") or [],
-        "document_files": record.get("document_files") or [],
-        "links": record.get("links") or [],
-        "language": record.get("language", ""),
-        "collected_at": record.get("collected_at", ""),
-        "html_file": html_rel,
-    }
 
 
 def _overall_record(record: dict, text_on: bool) -> dict:
@@ -482,16 +458,6 @@ def _media_plan(site: Path, record: dict, dest_root: Path,
     return plan
 
 
-def _html_plan(site: Path, record: dict, dest_root: Path) -> dict | None:
-    src = _rel_path(site, record.get("html_path"))
-    name = f"{_slug(record.get('prid') or 'page')}.html"
-    if src is not None:
-        return {"src": src, "dst": dest_root / "HTML" / name, "generated": False}
-    # Older records have no stored HTML; write a readable text snapshot so the
-    # HTML folder is still complete.
-    return {"record": record, "dst": dest_root / "HTML" / name, "generated": True}
-
-
 def _copy_file(src: Path, dst: Path, cache: dict | None = None) -> str:
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -510,30 +476,6 @@ def _copy_file(src: Path, dst: Path, cache: dict | None = None) -> str:
         return "copied"
     except OSError:
         return "error"
-
-
-def _write_generated_html(path: Path, record: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    title = html_lib.escape(str(record.get("title") or ""))
-    text = html_lib.escape(str(record.get("text") or ""))
-    url = html_lib.escape(str(record.get("source_url") or ""))
-    path.write_text(
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\">"
-        f"<title>{title}</title></head><body>\n"
-        f"<!-- generated from stored text; raw HTML was not saved -->\n"
-        f"<h1>{title}</h1>\n<p><a href=\"{url}\">{url}</a></p>\n"
-        f"<pre>{text}</pre>\n</body></html>\n",
-        encoding="utf-8",
-    )
-
-
-# --------------------------------------------------------------- skeleton ---
-def _make_page_dirs(folder: Path, *, external: bool) -> None:
-    for name in ("Images", "Videos", "Documents"):
-        (folder / name).mkdir(parents=True, exist_ok=True)
-    (folder / "HTML").mkdir(parents=True, exist_ok=True)
-    if not external:
-        (folder / "Links").mkdir(parents=True, exist_ok=True)
 
 
 # ------------------------------------------------------------------ build ---
@@ -619,7 +561,6 @@ def build(site: Path, config: dict,
             "audio": sum(len(r.get("audio_paths") or []) for r in rows),
             "video": sum(len(r.get("video_paths") or []) for r in rows),
             "documents": sum(len(r.get("document_paths") or []) for r in rows),
-            "html": sum(1 for r in rows if r.get("html_path")),
             "complete": all(
                 bool(str(r.get("title") or "").strip()
                      or str(r.get("text") or "").strip())
@@ -646,8 +587,8 @@ def build(site: Path, config: dict,
         "links": sum(len(r.get("links") or []) for r in master),
     }
 
-    # Nothing is copied here: the crawler already stored every page, HTML file
-    # and media file under categories/.  Counts describe what is on disk, and
+    # Nothing is copied here: the crawler already stored every page and media
+    # file under categories/.  Counts describe what is on disk, and
     # report how many files would be written by a separate de-duped export.
     media_fields = (
         ("image", "image_paths"), ("pdf", "pdf_paths"),
@@ -658,7 +599,6 @@ def build(site: Path, config: dict,
     for kind, field in media_fields:
         per_kind[kind] = sum(len(r.get(field) or []) for r in master)
     copied = sum(per_kind.values())
-    html_files = sum(1 for r in master if r.get("html_path"))
     skipped = errors = duplicates = bytes_copied = 0
     duplicate_examples: list[dict] = []
 
@@ -694,7 +634,6 @@ def build(site: Path, config: dict,
         },
         "category_coverage": category_coverage,
         "media": dict(per_kind),
-        "html_files": html_files,
         "duplicates_removed": 0,
         "deduplicated": False,
     }
@@ -742,7 +681,6 @@ def build(site: Path, config: dict,
         "render_failed_records": render_failed_records,
         "files_copied": 0,
         "bytes_copied": bytes_copied,
-        "html_files": html_files,
         "text_included": text_on,
         "deduplicated": False,
         "legacy_folders": [

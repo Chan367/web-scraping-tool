@@ -180,7 +180,6 @@ Scraped_Data/<website_name>/
   categories/                 the ONLY content store (full, not de-duplicated)
     <category>/
       pages.jsonl
-      html/
       media/
     external_sites/
   Json/
@@ -194,7 +193,7 @@ Scraped_Data/<website_name>/
 ```
 
 - `Internal_Pages/` and `External_Pages/` are no longer created. External pages
-  live in `categories/external_sites/`.
+  live in `categories/external_sites/`. Raw HTML snapshots are not saved either.
 - The original scrape is left non-de-duplicated. Use the **De-dupe** tab to
   create a separate de-duplicated copy somewhere else.
 - `website_info.json` summarises the site; `scraping_summary.json` summarises

@@ -272,7 +272,6 @@ Scraped_Data\<website_name>\
   categories\                         the single source of truth
     <category>\
       pages.jsonl
-      html\
       media\
     external_sites\
   Json\
@@ -286,7 +285,8 @@ Scraped_Data\<website_name>\
 ```
 
 `Internal_Pages/` and `External_Pages/` are **not** created. External pages live
-in `categories/external_sites/`.
+in `categories/external_sites/`. Raw HTML snapshot files are **not** saved either;
+the JSON record plus downloaded media are the deliverable.
 
 ---
 

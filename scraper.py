@@ -4285,30 +4285,6 @@ class Crawler:
             self.external_pages += 1
             return True
 
-    def _save_html(
-        self, category: CategoryInfo, page_id: str, content: Any
-    ) -> str:
-        """Store the page source under ``categories/<cat>/html/<prid>.html``.
-
-        The packager copies this into the delivery tree's ``HTML/`` folder.
-        Failures are non-fatal: the record is still saved without HTML.
-        """
-        if not content:
-            return ""
-        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(page_id))[:120] or "page"
-        try:
-            folder = category.path / "html"
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / f"{safe_id}.html"
-            if isinstance(content, bytes):
-                path.write_bytes(content)
-            else:
-                path.write_text(str(content), encoding="utf-8", errors="replace")
-            return self.site.rel(path)
-        except Exception as exc:  # pragma: no cover - non fatal
-            logger.debug("Could not save HTML for %s: %s", page_id, exc)
-            return ""
-
     def _image_format_allowed(self, url: str) -> bool:
         """True when an image URL's extension is one the user selected.
 
@@ -4886,10 +4862,6 @@ class Crawler:
             logger.warning("HTML parse failed for %s: %s", final_url, exc)
             return [], 0, False, final_url
 
-        # Keep a copy of the page source for the output tree's HTML/ folders.
-        # The rendered version is used when the JavaScript fallback ran.
-        html_bytes = content
-
         # Some CDNs (Akamai in front of india.gov.in / dahd.gov.in) answer with
         # HTTP 200 and an "Access Denied" page instead of a 403.  Never store
         # that as data, and slow the crawl down when it happens.
@@ -4926,7 +4898,6 @@ class Crawler:
         if self.js_enabled and self._needs_render(parsed):
             rendered = self._render_with_playwright(final_url)
             if rendered:
-                html_bytes = rendered
                 try:
                     parsed = self.parser.parse(rendered, final_url)
                 except Exception as exc:
@@ -4989,7 +4960,6 @@ class Crawler:
 
         fields = content_fields(parsed)
         fingerprint = content_fingerprint(fields)
-        html_rel = self._save_html(category, page_id, html_bytes)
         refresh_target = self._refresh_targets.get(item.url) if item.refresh else None
         force_kinds: set[str] = set()
         if item.refresh and self.refresh_media:
@@ -5031,7 +5001,6 @@ class Crawler:
             "pdf_text_paths": media["pdf_text"],
             "document_files": list(parsed.documents),
             "document_paths": media["documents"],
-            "html_path": html_rel,
         }
         if render_failed:
             record["render_failed"] = True
@@ -6249,9 +6218,9 @@ def repair_empty_pages(
 ) -> dict:
     """Re-render stored pages that have no title/text, in place.
 
-    Only content fields and the stored HTML snapshot are replaced.  The page
-    id, category, source URL, collected timestamp and every downloaded media
-    path are preserved, so nothing already collected is lost.  Progress is
+    Only content fields are replaced.  The page id, category, source URL,
+    collected timestamp and every downloaded media path are preserved, so
+    nothing already collected is lost.  Progress is
     written to ``data/repair_progress.json`` so the web app can show it.
     """
     stats = {
@@ -6380,16 +6349,6 @@ def repair_empty_pages(
             })
             record.pop("render_failed", None)
             record.pop("render_error", None)
-
-            safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_",
-                             str(record.get("prid") or "page"))[:120] or "page"
-            try:
-                html_dir = site.category_dir(folder) / "html"
-                html_dir.mkdir(parents=True, exist_ok=True)
-                (html_dir / f"{safe_id}.html").write_bytes(html_bytes)
-                record["html_path"] = site.rel(html_dir / f"{safe_id}.html")
-            except OSError:
-                pass
             storage.upsert(record, folder)
             stats["repaired"] += 1
             logger.info("Repaired empty page: %s", url)
