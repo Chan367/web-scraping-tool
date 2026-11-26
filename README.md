@@ -357,6 +357,11 @@ both. Internal depth and external hop depth are separate limits; zero means no
 depth limit. With **Complete each category** enabled, the scheduler waits for
 the active category's workers, their downloads, and newly queued children.
 
+`robots.txt` redirects are followed, so sites that move their policy file from
+`example.com/robots.txt` to `www.example.com/robots.txt` are not mistaken for
+blocked origins. A missing or WAF-blocked (4xx) robots file means "no extra
+restrictions"; only a 5xx/unreachable file disables crawling for that origin.
+
 **Follow hyperlinks** and **Explore interactive controls** can be switched
 independently of body text and file downloads. `navigation.py` discovers
 declared routes, pagination and document viewers, and uses Chromium for

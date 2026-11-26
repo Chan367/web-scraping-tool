@@ -1166,29 +1166,37 @@ class RobotsGate:
         robots_url = f"{key}/robots.txt"
         parser: Optional[RobotFileParser] = None
         try:
+            # A robots.txt redirect (dof.gov.in -> www.dof.gov.in, for
+            # example) is normal.  Follow it; rejecting the whole origin
+            # because of a 302 makes the crawler refuse sites that explicitly
+            # allow crawling.
             resp = requests.get(
                 robots_url,
                 headers={"User-Agent": self.user_agent},
                 timeout=self.timeout,
-                allow_redirects=False,
+                allow_redirects=True,
             )
-            if resp.status_code in (401, 403, 429) or resp.status_code >= 500 or resp.is_redirect:
+            status = resp.status_code
+            if status >= 500:
+                # RFC 9309: an unreachable robots file means "disallow all".
                 logger.warning(
                     "robots.txt returned HTTP %d for %s; skipping this origin.",
-                    resp.status_code, robots_url,
+                    status, robots_url,
                 )
                 parser = RobotFileParser()
                 parser.disallow_all = True
-            elif resp.status_code == 200:
+            elif status == 200:
                 parser = RobotFileParser()
-                parser.set_url(robots_url)
+                parser.set_url(resp.url or robots_url)
                 parser.parse(resp.text.splitlines())
             else:
-                parser = None  # 404 / 410 / other -> allow
-        except requests.RequestException:
+                # RFC 9309: 4xx means no restrictions.  A WAF may answer 403
+                # for robots.txt while the site itself is crawlable.
+                parser = None
+        except requests.RequestException as exc:
             parser = RobotFileParser()
             parser.disallow_all = True
-            logger.debug("robots.txt fetch failed for %s", robots_url)
+            logger.debug("robots.txt fetch failed for %s: %s", robots_url, exc)
         with self._lock:
             self._cache[key] = parser
         return parser

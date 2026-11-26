@@ -53,7 +53,12 @@ class Site(BaseHTTPRequestHandler):
             self.send_header("Location", offsite + "/external")
             self.end_headers()
             return
-        if path == "/robots.txt":
+        if path == "/robots.txt" and getattr(self.server, "redirect_robots", False):
+            self.send_response(302)
+            self.send_header("Location", "/robots-final.txt")
+            self.end_headers()
+            return
+        if path in ("/robots.txt", "/robots-final.txt"):
             body, mime = b"User-agent: *\nDisallow: /private\n", "text/plain"
         elif path in pages:
             more = '<a href="/new">new</a>' if path == "/records" and self.server.updated else ""
@@ -87,6 +92,7 @@ class Crawl(unittest.TestCase):
         self.server.requests = []
         self.server.not_modified = []
         self.server.updated = False
+        self.server.redirect_robots = False
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -153,6 +159,17 @@ class Crawl(unittest.TestCase):
         requests = {p for _,p in self.server.requests}
         self.assertIn("/jump", requests)
         self.assertFalse({"/external", "/private", "/hidden", "/one.pdf"} & requests)
+
+    def test_robots_redirect(self):
+        # dof.gov.in redirects its robots.txt to www.dof.gov.in.  A 302 must
+        # not make the crawler treat the whole origin as disallowed.
+        self.server.redirect_robots = True
+        rows = self.crawl("--no-media", "--no-buttons", start="/options")
+        paths = {path for _, path in self.server.requests}
+        self.assertIn("/robots-final.txt", paths)
+        self.assertIn("/options", paths)
+        self.assertNotIn("/private", paths)
+        self.assertEqual(len(rows), 1)
 
     def test_browser(self):
         rows = self.crawl("--max-pages", "2", start="/js", browser=True)
