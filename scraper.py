@@ -88,7 +88,7 @@ import sys
 import threading
 import time
 import unicodedata
-from collections import Counter, deque
+from collections import Counter, deque, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +108,7 @@ import requests
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from tqdm import tqdm
 
+import navigation
 from translator import EnglishTranslator
 
 try:  # optional: trust the same certificate authorities as the operating system
@@ -519,6 +520,30 @@ def safe_component(
     return text
 
 
+def safe_topic_stem(
+    value: Any,
+    max_len: int = 120,
+    default: str = "document",
+    seed: str = "",
+) -> str:
+    """Make a Windows-safe filename stem while keeping normal spaces.
+
+    ``safe_component`` turns spaces into underscores, which is right for
+    folders but wrong for a document name copied from a Topic column.  This
+    helper only removes characters Windows forbids in filenames.
+    """
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" .")
+    if not text:
+        digest = hashlib.sha1((seed or str(value)).encode("utf-8")).hexdigest()[:8]
+        text = f"{default}_{digest}"
+    if text.lower() in WINDOWS_RESERVED:
+        text = f"_{text}"
+    return text[:max_len].strip(" .") or default
+
+
 def derive_site_name(start_url: str) -> str:
     """Derive ``india_gov_in`` style folder name from a URL's host."""
     try:
@@ -745,6 +770,7 @@ def content_fields(parsed: Any) -> dict[str, str]:
         "pdfs": "\n".join(sorted(getattr(parsed, "pdfs", None) or [])),
         "audio": "\n".join(sorted(getattr(parsed, "audios", None) or [])),
         "video": "\n".join(sorted(getattr(parsed, "videos", None) or [])),
+        "links": "\n".join(sorted(x["url"] for x in parsed.links)),
         "documents": "\n".join(sorted(getattr(parsed, "documents", None) or [])),
     }
     return {
@@ -786,26 +812,48 @@ def files_identical(first: Path, second: Path, chunk_size: int = 1024 * 1024) ->
         return False
 
 
-def media_filename(url: str, directory: Path, kind: str, ext_hint: str = "") -> Path:
-    """Build a collision-free, path-length-safe filename for a media URL."""
-    parsed_name = ""
-    try:
-        parsed_name = Path(unquote(urlsplit(url).path)).name
-    except Exception:
-        parsed_name = ""
-    stem = Path(parsed_name).stem if parsed_name else kind
-    stem = safe_component(stem, max_len=60, default=kind, seed=url)
+def media_filename(
+    url: str,
+    directory: Path,
+    kind: str,
+    ext_hint: str = "",
+    display_name: str = "",
+) -> Path:
+    """Build a path-length-safe filename for a media URL.
+
+    With *display_name* the Topic-column text is used as the stem.  Without it
+    the old URL-based hashed stem is kept, so non-document media and pages with
+    no Topic column behave exactly as before.
+    """
     ext = (url_suffix(url) or ext_hint or KIND_DEFAULT_EXT.get(kind, ".bin")).lower()
     if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
         ext = KIND_DEFAULT_EXT.get(kind, ".bin")
+
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
-    name = f"{digest}_{stem}{ext}"
+    if display_name:
+        stem = safe_topic_stem(display_name, max_len=120, default=kind, seed=url)
+        name = f"{stem}{ext}"
+    else:
+        parsed_name = ""
+        try:
+            parsed_name = Path(unquote(urlsplit(url).path)).name
+        except Exception:
+            parsed_name = ""
+        raw_stem = Path(parsed_name).stem if parsed_name else kind
+        stem = safe_component(raw_stem, max_len=60, default=kind, seed=url)
+        name = f"{digest}_{stem}{ext}"
+
     budget = MAX_PATH_LEN - len(str(directory)) - 1
     if budget < 12:
-        name = f"{digest}{ext}"
-    elif len(name) > budget:
-        keep = max(8, budget - len(ext) - len(digest) - 1)
-        name = f"{digest}_{stem[:keep]}{ext}"
+        return directory / f"{digest}{ext}"
+    if len(name) > budget:
+        if display_name:
+            keep = max(8, budget - len(ext))
+            stem = stem[:keep].strip(" .") or kind
+            name = f"{stem}{ext}"
+        else:
+            keep = max(8, budget - len(ext) - len(digest) - 1)
+            name = f"{digest}_{stem[:keep]}{ext}"
     return directory / name
 
 
@@ -950,7 +998,8 @@ class RateLimiter:
         with self._lock:
             now = time.monotonic()
             slot = max(now, self._next_at)
-            self._next_at = slot + self.delay
+            # Small random jitter: perfectly even spacing looks robotic to WAFs.
+            self._next_at = slot + self.delay * random.uniform(1.0, 1.35)
         sleep_for = slot - time.monotonic()
         if sleep_for > 0:
             if stop_event is not None:
@@ -1110,7 +1159,7 @@ class RobotsGate:
             return None
         if not host:
             return None
-        key = f"{scheme}://{host}"
+        key = f"{scheme}://{parts.netloc}"
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
@@ -1121,16 +1170,15 @@ class RobotsGate:
                 robots_url,
                 headers={"User-Agent": self.user_agent},
                 timeout=self.timeout,
-                allow_redirects=True,
+                allow_redirects=False,
             )
-            if resp.status_code in (401, 403):
-                # RFC 9309 allows treating 4xx as "no robots.txt". 401/403 are
-                # usually a WAF blocking the client, so stay permissive but log.
+            if resp.status_code in (401, 403, 429) or resp.status_code >= 500 or resp.is_redirect:
                 logger.warning(
-                    "robots.txt returned HTTP %d for %s; assuming access is allowed.",
+                    "robots.txt returned HTTP %d for %s; skipping this origin.",
                     resp.status_code, robots_url,
                 )
-                parser = None
+                parser = RobotFileParser()
+                parser.disallow_all = True
             elif resp.status_code == 200:
                 parser = RobotFileParser()
                 parser.set_url(robots_url)
@@ -1138,7 +1186,8 @@ class RobotsGate:
             else:
                 parser = None  # 404 / 410 / other -> allow
         except requests.RequestException:
-            parser = None  # network issue -> be permissive, but log it
+            parser = RobotFileParser()
+            parser.disallow_all = True
             logger.debug("robots.txt fetch failed for %s", robots_url)
         with self._lock:
             self._cache[key] = parser
@@ -1214,6 +1263,17 @@ class HttpClient:
         self._throttle_lock = threading.Lock()
         self._last_throttle = 0.0
         self.throttle_events = 0
+        # Ban handling shared by every worker thread.  When the site starts
+        # refusing us (429/503, or 403 while a known-good page still loads) ALL
+        # requests pause together with an escalating back-off, then continue
+        # more slowly.  Pages are retried after the pause instead of being lost.
+        self._ban_lock = threading.Lock()
+        self._cooldown_until = 0.0
+        self._ban_level = 0
+        self._ok_streak = 0
+        self._probe_urls: dict[str, str] = {}
+        self.block_retries = 4
+        self.cooldowns = 0
 
     @staticmethod
     def _host_of(url: str) -> str:
@@ -1222,23 +1282,96 @@ class HttpClient:
         except Exception:
             return ""
 
-    def note_pressure(self, url: str, reason: str) -> None:
+    def note_pressure(self, url: str, reason: str, cooldown: bool = False) -> None:
         """Slow the whole crawl down after a rate-limit / block signal.
 
-        At most one increase is applied every 30 seconds, so a burst of 429s
-        seen by many worker threads cannot multiply the delay out of control.
+        The delay increase is applied at most once every 15 seconds so a burst
+        of 429s seen by many worker threads cannot multiply it out of control.
+        ``cooldown=True`` additionally pauses every worker (see start_cooldown).
         """
+        if cooldown:
+            self.start_cooldown(url, reason)
         now = time.monotonic()
         with self._throttle_lock:
-            if now - self._last_throttle < 30.0:
+            if now - self._last_throttle < 15.0:
                 return
             self._last_throttle = now
             self.throttle_events += 1
-        new_delay = self.limiter.slow_down()
+        new_delay = self.limiter.slow_down(factor=2.0)
         logger.warning(
             "Politeness: %s on %s -- slowing down to %.1fs between requests.",
             reason, url, new_delay,
         )
+
+    # -- ban handling -----------------------------------------------------
+    def wait_if_cooling(self) -> None:
+        """Block the calling worker while a site-wide cool-down is active."""
+        while not self.stop_event.is_set():
+            with self._ban_lock:
+                remaining = self._cooldown_until - time.monotonic()
+            if remaining <= 0:
+                return
+            self.stop_event.wait(min(remaining, 5.0))
+
+    def start_cooldown(self, url: str, reason: str, retry_after: float = 0.0) -> float:
+        """Pause all requests (30s, 60s, 120s ... up to 15 min, or Retry-After)."""
+        now = time.monotonic()
+        with self._ban_lock:
+            if now < self._cooldown_until:      # another worker already did it
+                return self._cooldown_until - now
+            self._ban_level = min(self._ban_level + 1, 6)
+            pause = min(900.0, max(float(retry_after or 0.0),
+                                   30.0 * 2 ** (self._ban_level - 1)))
+            self._cooldown_until = now + pause
+            self._ok_streak = 0
+            self.cooldowns += 1
+            level = self._ban_level
+        logger.warning(
+            "Block suspected (%s) at %s. Pausing ALL requests for %.0fs "
+            "(level %d), then continuing more slowly; the page will be retried.",
+            reason, url, pause, level,
+        )
+        return pause
+
+    def _note_ok(self, url: str, host: str) -> None:
+        with self._ban_lock:
+            self._ok_streak += 1
+            if self._ok_streak >= 20:
+                self._ban_level = 0
+            if host and host not in self._probe_urls and url.rstrip("/").count("/") <= 3:
+                self._probe_urls[host] = url    # a shallow known-good page
+
+    def _host_is_banned(self, host: str, failing_url: str) -> bool:
+        """After a 403: does a page that worked before still load?
+
+        If it does, only *this* URL is forbidden (a permanent per-page 403) and
+        pausing the whole crawl would be wrong.  If it does not (or nothing has
+        ever worked), the site is refusing us and a cool-down is the right move.
+        """
+        with self._ban_lock:
+            probe = self._probe_urls.get(host)
+        if not probe or probe == failing_url:
+            return True
+        try:
+            self.limiter.wait(self.stop_event)
+            resp = self._session(self._is_insecure(host)).get(
+                probe, timeout=(10, 25), allow_redirects=False,
+            )
+            ok = resp.status_code == 200 and not looks_blocked_page(resp.text[:8000])
+            resp.close()
+            return not ok
+        except requests.RequestException:
+            return True
+
+    @staticmethod
+    def _origin_of(url: str) -> str:
+        try:
+            parts = urlsplit(url)
+            if parts.path in ("", "/") and not parts.query:
+                return ""                       # a first visit has no referer
+            return f"{parts.scheme}://{parts.netloc}/"
+        except Exception:
+            return ""
 
     @staticmethod
     def _is_cert_error(exc: Exception) -> bool:
@@ -1299,6 +1432,10 @@ class HttpClient:
                     "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
                     "Accept-Encoding": "gzip, deflate",
                     "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-User": "?1",
                 }
             )
             if insecure:
@@ -1318,19 +1455,31 @@ class HttpClient:
         stream: bool = False,
         check_robots: bool = True,
         referer: str = "",
+        validators: Optional[dict[str, str]] = None,
+        _redirects: int = 0,
     ) -> Optional[requests.Response]:
-        """GET a URL with retries/backoff. Returns ``None`` on failure."""
+        """GET a URL with retries, back-off and ban handling.
+
+        Returns ``None`` on failure.
+        """
         if self.stop_event.is_set():
             return None
         if check_robots and not self.robots.allowed(url):
             logger.info("Blocked by robots.txt: %s", url)
             return None
-        headers = {"Referer": referer} if referer else {}
+        ref = referer or self._origin_of(url)
+        headers = {"Referer": ref, "Sec-Fetch-Site": "same-origin"} if ref else {
+            "Sec-Fetch-Site": "none"}
         host = self._host_of(url)
+        headers.update(validators or {})
         last_error = ""
-        for attempt in range(1, self.retries + 1):
+        attempt = 0
+        block_cycles = 0
+        while attempt < self.retries:
+            attempt += 1
             if self.stop_event.is_set():
                 return None
+            self.wait_if_cooling()
             self.limiter.wait(self.stop_event)
             if self.stop_event.is_set():
                 return None
@@ -1342,10 +1491,20 @@ class HttpClient:
                     url,
                     timeout=self.timeout,
                     stream=stream,
-                    allow_redirects=True,
+                    allow_redirects=False,
                     headers=headers,
                     proxies=requests_proxies(proxy),
                 )
+                if resp.is_redirect:
+                    target = normalize_url(resp.headers["Location"], base=url)
+                    resp.close()
+                    if (not target or _redirects >= 10 or
+                            not getattr(self, "allow_redirect", lambda a, b: True)(url, target)):
+                        self.failures.add(url, "redirect out of scope or redirect limit")
+                        return None
+                    return self.get(target, stream=stream, referer=url,
+                                    validators=validators if same_site(url, target) else None,
+                                    _redirects=_redirects + 1)
                 if resp.status_code in (403, 429, 503):
                     self.note_pressure(url, f"HTTP {resp.status_code}")
                     if self.proxy_pool and proxy:
@@ -1359,6 +1518,21 @@ class HttpClient:
                                 resp.status_code, url, attempt, self.retries, wait,
                             )
                             self.stop_event.wait(wait)
+                            continue
+                    elif block_cycles < self.block_retries:
+                        code = resp.status_code
+                        retry_after = resp.headers.get("Retry-After", "")
+                        # 429/503 always mean "slow down".  A 403 is a site-wide
+                        # ban only when a page that loaded earlier now fails too.
+                        if code in (429, 503) or self._host_is_banned(host, url):
+                            block_cycles += 1
+                            resp.close()
+                            self.start_cooldown(
+                                url, f"HTTP {code}",
+                                float(retry_after) if retry_after.isdigit() else 0.0,
+                            )
+                            last_error = f"HTTP {code}"
+                            attempt -= 1        # a ban retry is not a normal attempt
                             continue
                 if resp.status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < self.retries:
                     retry_after = resp.headers.get("Retry-After", "")
@@ -1380,6 +1554,7 @@ class HttpClient:
                     continue
                 if self.proxy_pool and proxy:
                     self.proxy_pool.mark_good(proxy)
+                self._note_ok(url, host)
                 return resp
             except requests.RequestException as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
@@ -1418,6 +1593,7 @@ class HttpClient:
         for attempt in range(1, self.retries + 1):
             if self.stop_event.is_set():
                 return None
+            self.wait_if_cooling()
             self.limiter.wait(self.stop_event)
             if self.stop_event.is_set():
                 return None
@@ -1541,6 +1717,8 @@ class SiteFolderManager:
         try:
             if self.source_path != target.resolve():
                 shutil.copy2(self.source_path, target)
+                for name in ("translator.py", "navigation.py"):
+                    shutil.copy2(self.source_path.with_name(name), target.with_name(name))
         except Exception as exc:  # pragma: no cover - non fatal
             logger.debug("Could not copy scraper source: %s", exc)
         req = self.scraper_dir / "requirements.txt"
@@ -1874,6 +2052,9 @@ class ParsedPage:
     videos: list[str] = field(default_factory=list)
     documents: list[str] = field(default_factory=list)
     links: list[dict[str, str]] = field(default_factory=list)
+    # URL -> human name taken from a table's Topic column, for file naming.
+    download_names: dict[str, str] = field(default_factory=dict)
+    interactive: bool = False
     breadcrumbs: list[str] = field(default_factory=list)
     nav_entries: list[tuple[str, str]] = field(default_factory=list)
     nav_parent: str = ""
@@ -1916,6 +2097,201 @@ BOILERPLATE_SELECTORS = (
 )
 
 
+def extract_topic_download_names(soup, page_url: str) -> dict[str, str]:
+    """Map PDF/document URLs to the text in the table's ``Topic`` column.
+
+    Many government listing pages show a table like::
+
+        Topic                         Download
+        Annual Report 2023            [PDF]
+
+    The scraper normally keeps only the anchor text, which is often just
+    "Download" or an icon.  This helper reads the named column instead so the
+    saved file can use the real topic name.
+    """
+    names: dict[str, str] = {}
+
+    def absolute(raw: str) -> str:
+        try:
+            return urljoin(page_url, str(raw or "").strip())
+        except Exception:
+            return ""
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+
+        topic_index: int | None = None
+        for row in rows[:4]:
+            cells = row.find_all(["th", "td"])
+            for index, cell in enumerate(cells):
+                label = clean_ws(cell.get_text(" ", strip=True), 80)
+                label = label.lower().strip(" :")
+                if label in (
+                    "topic", "topic name", "topics", "topic/title",
+                    "विषय", "विषय नाम",
+                ):
+                    topic_index = index
+                    break
+            if topic_index is not None:
+                break
+        if topic_index is None:
+            continue
+
+        for row in rows:
+            cells = row.find_all(["th", "td"], recursive=False)
+            if len(cells) <= topic_index:
+                cells = row.find_all(["th", "td"])
+            if len(cells) <= topic_index:
+                continue
+            topic = clean_ws(cells[topic_index].get_text(" ", strip=True), 200)
+            if len(topic) < 2:
+                continue
+            for anchor in row.find_all("a", href=True):
+                url = absolute(anchor.get("href"))
+                if not url:
+                    continue
+                names.setdefault(url, topic)
+    return names
+
+
+GENERIC_DOWNLOAD_WORDS = {
+    "download", "downloads", "download pdf", "download file", "click here",
+    "here", "link", "pdf", "doc", "document", "view", "open", "more",
+    "read more", "details", "file", "attach", "attachment", "go", "submit",
+}
+ICON_WORDS = {"visibility", "visible", "eye", "icon", "fa", "bi"}
+TEXT_LABEL_PREFIXES = (
+    "published date", "due date", "type/size", "tender id",
+    "posted on", "uploaded on", "date",
+)
+
+
+def _clean_display_text(value: Any) -> str:
+    """Remove size/type decorations such as '(PDF)|151.35 KB'."""
+    text = clean_ws(value, 200).strip()
+    text = re.sub(
+        r"\s*[|]?\s*\d+(?:[.,]\d+)?\s*(?:KB|MB|GB)\s*$",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s*\((?:pdf|doc|document)\)\s*$", "", text, flags=re.IGNORECASE
+    )
+    return text.strip(" |:-")
+
+
+def _useful_link_text(links: Any, url: str) -> str:
+    """Strip icon/generic words such as 'visibility View' from anchor text."""
+    ignored = GENERIC_DOWNLOAD_WORDS | ICON_WORDS
+    for link in (links or []):
+        if str(link.get("url") or "") != url:
+            continue
+        words = clean_ws(link.get("text"), 150).split()
+        kept = [
+            word for word in words
+            if word.strip(" .:-").lower() not in ignored
+        ]
+        text = _clean_display_text(" ".join(kept))
+        if len(text) >= 3:
+            return text
+    return ""
+
+
+def _opaque_name(value: Any) -> bool:
+    """True when a URL filename is an ID/hash and not a human name."""
+    text = str(value or "").strip()
+    if not text or text.lower() in GENERIC_DOWNLOAD_WORDS:
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{12,}", text):
+        return True
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+        r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        text,
+    ):
+        return True
+    if re.fullmatch(r"\d{8,}", text):
+        return True
+    if (
+        len(text) >= 20
+        and " " not in text and "_" not in text and "-" not in text
+        and len(re.findall(r"[A-Za-z]", text)) <= 2
+    ):
+        return True
+    return False
+
+
+def scrape_title_name(text: Any, index: int = 0) -> str:
+    """Get the Nth value shown after a 'Title:' line in scraped page text."""
+    lines = str(text or "").splitlines()
+    titles: list[str] = []
+    labels = ("title", "शीर्षक")
+    for position, line in enumerate(lines):
+        if clean_ws(line, 80).strip().rstrip(":").lower() not in labels:
+            continue
+        for candidate_line in lines[position + 1: position + 4]:
+            candidate = clean_ws(candidate_line, 200).strip()
+            if not candidate:
+                continue
+            low = candidate.lower().rstrip(":")
+            if low in GENERIC_DOWNLOAD_WORDS or low in labels:
+                break
+            if low.startswith(TEXT_LABEL_PREFIXES):
+                break
+            candidate = _clean_display_text(candidate)
+            if candidate:
+                titles.append(candidate)
+            break
+    if 0 <= index < len(titles):
+        return titles[index]
+    return ""
+
+
+def fallback_download_name(
+    title: Any,
+    links: Any,
+    url: str,
+    kind: str,
+    page_id: str = "",
+    text: Any = "",
+    index: int = 0,
+) -> str:
+    """Build a meaningful filename when no Topic column is available.
+
+    Order: scraped ``Title:`` value, readable URL filename, useful link text,
+    page title, then a safe ``kind_pageid`` last resort.  Hash-like filenames
+    such as ``0ad135d10faed...pdf`` are never used as a name.
+    """
+    scraped = scrape_title_name(text, index)
+    if scraped:
+        return scraped
+
+    page_title = clean_ws(title, 150).strip()
+    if page_title.lower() in GENERIC_DOWNLOAD_WORDS:
+        page_title = ""
+
+    original = ""
+    try:
+        original = Path(unquote(urlsplit(url).path)).name
+    except Exception:
+        original = ""
+    original_stem = clean_ws(Path(original).stem if original else "", 150).strip()
+    opaque = _opaque_name(original_stem)
+
+    if original_stem and not opaque:
+        if page_title:
+            return f"{page_title} - {original_stem}"
+        return original_stem
+
+    link_text = _useful_link_text(links, url)
+    if link_text:
+        return link_text
+    if page_title:
+        return page_title
+    return f"{kind}_{page_id or 'file'}"
+
+
 class Parser:
     """Extract title, text, dates, links and media from HTML."""
 
@@ -1927,6 +2303,7 @@ class Parser:
 
     def __init__(self, site_host: str) -> None:
         self.site_host = site_host
+        self.buttons = self.hyperlinks = self.collect_text = True
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
@@ -1975,12 +2352,17 @@ class Parser:
         else:
             soup = BeautifulSoup(content, "lxml")
 
-        parsed = ParsedPage()
+        parsed = ParsedPage(interactive=bool(
+            (self.buttons and soup.select_one(navigation.CONTROLS)) or
+            soup.select_one("script[src],script:not([type]),[loading=lazy],[data-src]")))
+        base = soup.find("base", href=True)
+        base_url = (self._abs(base["href"], page_url) if base else None) or page_url
         parsed.title = self._extract_title(soup)
         parsed.breadcrumbs = self._extract_breadcrumbs(soup, parsed.title)
         parsed.nav_entries = self._extract_nav_entries(soup, page_url)
         parsed.nav_parent = self._extract_nav_parent(soup, page_url)
-        self._extract_links_and_media(soup, page_url, parsed)
+        parsed.download_names = extract_topic_download_names(soup, base_url)
+        self._extract_links_and_media(soup, base_url, parsed)
         parsed.date_time = self._extract_date(soup, page_url)
         parsed.language = self._extract_language(soup)
         parsed.text = self._extract_text(soup)
@@ -2282,20 +2664,16 @@ class Parser:
                 if absolute:
                     add_image(absolute, "video poster")
 
-        # <a href> -- links plus downloadable files
-        for anchor in soup.find_all("a", href=True):
-            raw = str(anchor.get("href") or "").strip()
-            if not raw or raw.startswith("#"):
-                continue
+        # Media selection is independent of following ordinary hyperlinks.
+        for anchor in soup.select("a[href]"):
+            absolute = self._abs(anchor["href"], page_url)
+            if absolute:
+                add_by_kind(absolute, alt=anchor.get_text(" ", strip=True))
+        for raw, label in navigation.discover(soup, self.hyperlinks, self.buttons):
             absolute = self._abs(raw, page_url)
             if not absolute:
                 continue
-            text = clean_ws(
-                anchor.get_text(" ", strip=True)
-                or anchor.get("title", "")
-                or anchor.get("aria-label", ""),
-                300,
-            )
+            text = clean_ws(label, 300)
             if absolute not in link_seen and len(link_seen) < MAX_LINKS_PER_PAGE:
                 link_seen.add(absolute)
                 parsed.links.append(
@@ -2609,6 +2987,21 @@ class Downloader:
         self.youtube_enabled = youtube_enabled
         # When False, PDFs are downloaded without extracting a .txt sidecar.
         self.pdf_text = bool(pdf_text)
+        self.cache_file = site.data_dir / "download_index.json"
+        self.cache_lock = threading.Lock()
+        self.url_locks = [threading.Lock() for _ in range(64)]
+        try:
+            self.cache = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.cache = {}
+        self.owners = {v["path"].casefold(): u for u, v in self.cache.items()}
+        self.checked = set()
+
+    def save_index(self):
+        with self.cache_lock:
+            tmp = self.cache_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.cache, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.cache_file)
 
     @staticmethod
     def _ext_from_ctype(content_type: str) -> str:
@@ -2654,7 +3047,11 @@ class Downloader:
             text_relative_path=text_rel,
         )
 
-    def download(
+    def download(self, url, category, page_id, kind, referrer="", force=False, display_name=""):
+        with self.url_locks[hash(url) % len(self.url_locks)]:
+            return self._download(url, category, page_id, kind, referrer, force, display_name)
+
+    def _download(
         self,
         url: str,
         category: CategoryInfo,
@@ -2662,11 +3059,14 @@ class Downloader:
         kind: str,
         referrer: str = "",
         force: bool = False,
+        display_name: str = "",
     ) -> Optional[DownloadResult]:
         """Download one URL into its category/page folder (skip if present).
 
         With *force* an existing file is re-downloaded and replaced only when
-        its bytes differ, which is how ``--refresh-media`` stays cheap.
+        its bytes differ, which is how ``--refresh-media`` stays cheap.  When
+        *display_name* is supplied (the Topic-column text), it becomes the
+        saved filename instead of the URL-based hashed name.
         """
         if self.stop_event.is_set():
             return None
@@ -2676,16 +3076,26 @@ class Downloader:
         directory = self.site.media_dir(category.folder, kind, page_id)
         directory.mkdir(parents=True, exist_ok=True)
         tentative_ext = url_suffix(url) or KIND_DEFAULT_EXT.get(kind, ".bin")
-        tentative = media_filename(url, directory, kind, tentative_ext)
-        existing = self._existing_result(tentative, kind)
-        if existing is not None and not force:
+        tentative = media_filename(
+            url, directory, kind, tentative_ext, display_name=display_name
+        )
+        with self.cache_lock:
+            entry = self.cache.get(url, {})
+        cached = self.site.site_dir / entry["path"] if entry else None
+        existing = self._existing_result(cached, kind) if cached else None
+        if existing and (not force or url in self.checked):
             return existing
-
-        response = self.http.get(url, stream=True, referer=referrer)
+        conditional = {}
+        if existing:
+            conditional = entry.get("validators", {})
+        response = self.http.get(url, stream=True, referer=referrer, validators=conditional)
         if response is None:
-            return None
+            return existing
         tmp_path: Optional[Path] = None
         try:
+            if response.status_code == 304 and existing:
+                self.checked.add(url)
+                return existing
             ctype = response.headers.get("Content-Type", "")
             if not self._content_type_ok(kind, ctype):
                 self.failures.add(url, f"unexpected content-type: {ctype or 'unknown'}")
@@ -2696,10 +3106,22 @@ class Downloader:
                 return None
 
             ext = url_suffix(url) or self._ext_from_ctype(ctype) or KIND_DEFAULT_EXT.get(kind, ".bin")
-            path = media_filename(url, directory, kind, ext)
-            existing = self._existing_result(path, kind)
-            if existing is not None and not force:
-                return existing
+            path = media_filename(
+                url, directory, kind, ext, display_name=display_name
+            )
+            if existing:
+                path = cached
+            else:
+                with self.cache_lock:
+                    number = 0
+                    base_path = path
+                    while (self.owners.get(self.site.rel(path).casefold(), url) != url or
+                           (path.exists() and self.site.rel(path).casefold() not in self.owners)):
+                        number += 1
+                        suffix = f"-{number}{base_path.suffix}"
+                        room = max(1, MAX_PATH_LEN - len(str(directory)) - 1 - len(suffix))
+                        path = directory / (base_path.stem[:room] + suffix)
+                    self.owners[self.site.rel(path).casefold()] = url
 
             tmp_path = path.with_name(path.name + ".part")
             written = 0
@@ -2718,17 +3140,26 @@ class Downloader:
                 return None
 
             had_existing = path.exists()
-            if force and had_existing and files_identical(path, tmp_path):
+            validators = {header: response.headers[name] for name, header in
+                          (("ETag", "If-None-Match"), ("Last-Modified", "If-Modified-Since"))
+                          if response.headers.get(name)}
+            if had_existing and files_identical(path, tmp_path):
                 try:
                     tmp_path.unlink()
                 except OSError:
                     pass
                 tmp_path = None
                 logger.debug("Refreshed media is unchanged, kept: %s", path)
+                with self.cache_lock:
+                    self.cache[url] = {"path": self.site.rel(path), "validators": validators}
+                    self.checked.add(url)
                 return self._existing_result(path, kind)
 
             os.replace(tmp_path, path)
             tmp_path = None
+            with self.cache_lock:
+                self.cache[url] = {"path": self.site.rel(path), "validators": validators}
+                self.checked.add(url)
 
             text_rel = None
             if kind == "pdf" and self.pdf_text:
@@ -2953,8 +3384,9 @@ class Storage:
                         continue
                     if not replaced:
                         try:
-                            if json.loads(stripped).get("prid") == prid:
-                                dst.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            previous = json.loads(stripped)
+                            if previous.get("prid") == prid:
+                                dst.write(json.dumps({**previous, **record}, ensure_ascii=False) + "\n")
                                 replaced = True
                                 continue
                         except Exception:
@@ -3938,6 +4370,7 @@ class QueueItem:
     external: bool = False
     refresh: bool = False
     internal_depth: int = 0
+    display_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -3950,6 +4383,7 @@ class QueueItem:
             "external": self.external,
             "refresh": self.refresh,
             "internal_depth": self.internal_depth,
+            "display_name": self.display_name,
         }
 
     @classmethod
@@ -3964,6 +4398,7 @@ class QueueItem:
             external=bool(payload.get("external")),
             refresh=bool(payload.get("refresh")),
             internal_depth=max(0, int(payload.get("internal_depth") or 0)),
+            display_name=str(payload.get("display_name") or ""),
         )
 
 
@@ -4066,6 +4501,7 @@ class Crawler:
         follow_service_links: bool = False,
         internal_first: bool = False,
         include_service_pages: bool = False,
+        category_complete: bool = False,
         drain_only: bool = False,
         refresh_existing: bool = False,
         refresh_after_days: float = 0.0,
@@ -4100,6 +4536,7 @@ class Crawler:
         self.refresh_links = max(0, refresh_links)
         self.seed_file = seed_file
         self.media_enabled = media_enabled
+        self.formats = {}
         self.download_images = bool(download_images)
         # None = every media kind; otherwise only these kinds are downloaded
         # (the URLs are still stored in the record either way).
@@ -4113,8 +4550,12 @@ class Crawler:
         }
         self.image_formats = cleaned_formats or None
         self.follow_external = bool(follow_external)
+        self.http.allow_redirect = lambda source, target: (
+            is_internal(target, self.site.host) or
+            (self.follow_external and self._external_host_allowed(target) and
+             (is_internal(source, self.site.host) or same_site(source, target))))
         self.external_max_pages = max(0, int(external_max_pages))
-        self.max_depth = max(1, int(max_depth))
+        self.max_depth = max(0, int(max_depth))
         # 0 = follow internal links as deep as the site goes (old behaviour).
         self.max_internal_depth = max(0, int(max_internal_depth))
         # External web scrap: internal pages are only used to find off-site
@@ -4128,12 +4569,15 @@ class Crawler:
         self._external_seen: set[str] = set()
         self._external_budget_logged = False
 
-        # --internal-first / --include-service-pages bookkeeping
+        # --internal-first / --include-service-pages / --category-complete bookkeeping
         self.internal_first = bool(internal_first)
         self.include_service_pages = bool(include_service_pages)
+        self.category_complete = bool(category_complete)
         self._service_page_urls: set[str] = set()
         self._service_done: set[str] = set()
         self._service_lock = threading.Lock()
+        # Category-complete: track which category we're currently exhausting
+        self._active_category: Optional[str] = None
         if self.include_service_pages:
             self._load_service_page_targets()
 
@@ -4190,6 +4634,7 @@ class Crawler:
         # therefore produced no data at all.
         self.start_failed = False
         self._failed_urls: set[str] = set()
+        self._block_retried: set[str] = set()
 
     # -- state helpers ----------------------------------------------------
     def _save_snapshot(
@@ -4205,6 +4650,7 @@ class Crawler:
         visited_snapshot = set(visited) - {item.url for item in inflight_items}
         try:
             self.state.save(visited_snapshot, queue_items, pages_done, completed)
+            self.downloader.save_index()
             self.categories.write_index()
             self.index.save()
             if self.refresh_existing:
@@ -4285,6 +4731,16 @@ class Crawler:
             self.external_pages += 1
             return True
 
+    def _selected(self, kind, url):
+        if not self.media_enabled or (self.media_kinds is not None and kind not in self.media_kinds):
+            return False
+        internal = is_internal(url, self.site.host)
+        if (self.external_only and internal) or (not internal and
+                (not self.follow_external or not self._external_host_allowed(url))):
+            return False
+        suffix = url_suffix(url).lower().lstrip('.')
+        return kind not in self.formats or not suffix or suffix in self.formats[kind]
+
     def _image_format_allowed(self, url: str) -> bool:
         """True when an image URL's extension is one the user selected.
 
@@ -4315,7 +4771,7 @@ class Crawler:
         """
         result: dict[str, list[str]] = {
             "images": [], "pdfs": [], "audio": [], "video": [],
-            "documents": [], "pdf_text": [],
+            "documents": [], "pdf_text": [], "pdf_names": [], "document_names": [],
         }
         if not self.media_enabled:
             # Text/link-only crawl: keep the media URLs in the record without
@@ -4343,14 +4799,37 @@ class Crawler:
                     u for u, _ in parsed.images if self._image_format_allowed(u)
                 ]),
             )
+        seen_counts: dict[str, int] = {}
+        topic_names = getattr(parsed, "download_names", {}) or {}
         for kind, urls in jobs:
             key = KIND_COUNT_KEYS[kind]
+            name_key = (
+                "pdf_names" if kind == "pdf"
+                else "document_names" if kind == "document" else ""
+            )
             for url in urls:
                 if self.stop_event.is_set():
                     break
+                if not self._selected(kind, url) or (
+                    not is_internal(page_url, self.site.host) and not same_site(page_url, url)
+                ):
+                    continue
+                display_name = ""
+                if name_key:
+                    occurrence = seen_counts.get(name_key, 0)
+                    seen_counts[name_key] = occurrence + 1
+                    topic = str(topic_names.get(url) or "").strip()
+                    if not topic:
+                        topic = fallback_download_name(
+                            parsed.title, parsed.links, url, kind, page_id,
+                            text=parsed.text if len(urls) == 1 else "", index=occurrence,
+                        )
+                    if topic:
+                        base = safe_topic_stem(topic, max_len=100, default=kind, seed=url)
+                        display_name = base
                 downloaded = self.downloader.download(
                     url, category, page_id, kind, referrer=page_url,
-                    force=kind in force_kinds,
+                    force=kind in force_kinds, display_name=display_name,
                 )
                 if downloaded is None:
                     continue
@@ -4359,6 +4838,8 @@ class Crawler:
                         self.media_replaced += 1
                     logger.info("Replaced changed %s: %s", kind, downloaded.relative_path)
                 result[key].append(downloaded.relative_path)
+                if name_key and display_name:
+                    result[name_key].append(Path(downloaded.relative_path).name)
                 if downloaded.text_relative_path:
                     result["pdf_text"].append(downloaded.text_relative_path)
         return result
@@ -4376,7 +4857,7 @@ class Crawler:
     def _needs_render(self, parsed: ParsedPage) -> bool:
         if not self.js_enabled or not self._playwright_available:
             return False
-        if len(parsed.text) >= 300 and parsed.title:
+        if len(parsed.text) >= 300 and parsed.title and not parsed.interactive:
             return False
         title = (parsed.title or "").lower()
         return not any(
@@ -4398,6 +4879,8 @@ class Crawler:
             sys.executable, script, "--render-html", url,
             "--render-timeout", str(self.render_timeout),
         ]
+        if not self.parser.buttons:
+            cmd.append("--no-buttons")
         if proxy:
             cmd.extend(["--proxy", proxy])
         kwargs: dict[str, Any] = {
@@ -4420,7 +4903,7 @@ class Crawler:
         html = completed.stdout or b""
         text = html.decode("utf-8", "replace")
         blocked = looks_blocked_page(text)
-        if completed.returncode != 0 or len(html) < 500 or blocked:
+        if completed.returncode != 0 or not html.strip() or blocked:
             err = (completed.stderr or b"").decode("utf-8", "replace")[-400:].strip()
             logger.warning(
                 "JavaScript render did not help for %s (%s)",
@@ -4429,7 +4912,7 @@ class Crawler:
             with self._counter_lock:
                 self.render_failures += 1
             if blocked:
-                self.http.note_pressure(url, "rendered Access Denied page")
+                self.http.note_pressure(url, "rendered Access Denied page", cooldown=True)
                 if proxy and getattr(self.http, "proxy_pool", None):
                     self.http.proxy_pool.mark_bad(proxy, "rendered block page")
             return None
@@ -4523,17 +5006,23 @@ class Crawler:
             logger.info("Queued %d service page(s) for a full HTML fetch.", added)
         return added
 
-    @staticmethod
-    def _next_pending(
-        pending: deque["QueueItem"], internal_first: bool
-    ) -> "QueueItem":
-        """Pop the next URL, preferring on-site pages when asked."""
-        if internal_first:
-            for index, item in enumerate(pending):
-                if not item.external:
-                    del pending[index]
+    def _next_pending(self, pending, busy):
+        # Only the coordinator owns pending. In-flight workers may discover new
+        # children: wait for them before declaring their category exhausted.
+        if self.category_complete and self._active_category is not None:
+            for i, item in enumerate(pending):
+                if item.category_hint == self._active_category:
+                    del pending[i]
                     return item
-        return pending.popleft()
+            if busy:
+                return None
+        index = 0
+        if self.internal_first or self.category_complete:
+            index = next((i for i, item in enumerate(pending) if not item.external), 0)
+        item = pending[index]
+        del pending[index]
+        self._active_category = item.category_hint
+        return item
 
     # -- URL filtering ----------------------------------------------------
     def _is_other_language_url(self, url: str) -> bool:
@@ -4664,6 +5153,10 @@ class Crawler:
         ``--max-depth`` hops and ``--external-max-pages`` off-site pages.
         Once on an external site only links on that same site are followed, so
         the crawl cannot wander across the whole web.
+
+        When ``--category-complete`` is enabled, links are grouped by category
+        and the crawler exhausts all pages in one category before moving to
+        the next, ensuring deep scraping of paginated categories like Documents.
         """
         if self.drain_only:
             # Finish the already-queued URLs only; never discover new pages.
@@ -4692,7 +5185,8 @@ class Crawler:
                         QueueItem(
                             url=target,
                             kind="file",
-                            category_hint=EXTERNAL_CATEGORY,
+                            category_hint=category_hint,
+                            display_name=parsed.download_names.get(target) or link.get("text") or parsed.title,
                             referrer=final_url,
                             depth=1,
                             external=True,
@@ -4708,12 +5202,12 @@ class Crawler:
                 if not self.follow_external or not same_site(target, final_url):
                     continue
                 next_depth = depth + 1
-                if next_depth > self.max_depth:
+                if self.max_depth and next_depth > self.max_depth:
                     continue
                 if not self._external_host_allowed(target):
                     continue
                 next_external = True
-                hint = EXTERNAL_CATEGORY
+                hint = category_hint
                 next_internal = internal_depth
             elif target_internal:
                 next_internal = internal_depth + 1
@@ -4721,33 +5215,34 @@ class Crawler:
                     continue
                 next_depth = depth
                 next_external = False
-                hint = category_hint
+                hint = self.categories._nav_match(target) or (category_hint if category_hint.lower() != "uncategorized" else self.categories._segment_category(target)) or "uncategorized"
             else:
                 if not self.follow_external:
                     continue
                 if not self._external_host_allowed(target):
                     continue
                 next_depth = depth + 1
-                if next_depth > self.max_depth:
+                if self.max_depth and next_depth > self.max_depth:
                     continue
                 next_external = True
-                hint = EXTERNAL_CATEGORY
+                hint = category_hint
                 next_internal = internal_depth
 
             if next_external and not self._claim_external_page(target):
                 continue
             seen_links.add(target)
-            new_items.append(
-                QueueItem(
-                    url=target,
-                    kind="page",
-                    category_hint=hint,
-                    referrer=final_url,
-                    depth=next_depth,
-                    external=next_external,
-                    internal_depth=next_internal,
-                )
+            item = QueueItem(
+                url=target,
+                kind="page",
+                category_hint=hint,
+                referrer=final_url,
+                depth=next_depth,
+                external=next_external,
+                internal_depth=next_internal,
+                display_name=parsed.download_names.get(target) or link.get("text") or parsed.title,
             )
+
+            new_items.append(item)
         return new_items
 
     def _process(
@@ -4756,6 +5251,9 @@ class Crawler:
         """Process one queue item -> (new items, pages done, ok, final URL)."""
         if self.stop_event.is_set() or not item.url:
             return [], 0, False, ""
+        if not is_internal(item.url, self.site.host) and (
+                not self.follow_external or not self._external_host_allowed(item.url)):
+            return [], 0, True, item.url
 
         if (
             item.kind == "page"
@@ -4772,14 +5270,15 @@ class Crawler:
             category = self.categories.resolve(item.category_hint or "uncategorized")
             page_id = url_to_prid(item.referrer or item.url)
             kind = classify_media(item.url) or "document"
-            if not self.media_enabled:
+            if not self._selected(kind, item.url):
                 return [], 0, True, item.url
             if self.media_kinds is not None and kind not in self.media_kinds:
                 return [], 0, True, item.url
             if self.external_only and is_internal(item.url, self.site.host):
                 return [], 0, True, item.url
             downloaded = self.downloader.download(
-                item.url, category, page_id, kind, referrer=item.referrer
+                item.url, category, page_id, kind, referrer=item.referrer,
+                force=self.refresh_media, display_name=item.display_name if kind in ("pdf", "document") else ""
             )
             return [], (1 if downloaded else 0), bool(downloaded), ""
 
@@ -4794,6 +5293,7 @@ class Crawler:
         if (
             self.effective_incremental
             and not item.link_only
+            and not item.refresh
             and final_url
             and final_url != item.url
             and self.index.is_known(final_url)
@@ -4818,9 +5318,11 @@ class Crawler:
                 response.close()
             except Exception:
                 pass
-            if kind is None:
+            if kind is None or not self._selected(kind, final_url) or (self.external_only and is_internal(final_url,self.site.host)):
                 # CSS/JS/JSON/XML and similar web assets are not documents.
                 logger.debug("Skipping non-document response (%s): %s", ctype, final_url)
+                return [], 0, True, final_url
+            if kind in self.formats and self.downloader._ext_from_ctype(ctype).lstrip(".") not in self.formats[kind] and not classify_media(final_url):
                 return [], 0, True, final_url
             if kind == "image" and not self._image_format_allowed(final_url):
                 # The user selected other image formats, so keep this URL only
@@ -4833,7 +5335,8 @@ class Crawler:
             category = self.categories.resolve(item.category_hint or "uncategorized")
             page_id = url_to_prid(item.referrer or final_url)
             downloaded = self.downloader.download(
-                final_url, category, page_id, kind, referrer=item.referrer
+                final_url, category, page_id, kind, referrer=item.referrer,
+                force=self.refresh_media, display_name=item.display_name if kind in ("pdf", "document") else ""
             )
             return [], (1 if downloaded else 0), bool(downloaded), final_url
 
@@ -4869,10 +5372,35 @@ class Crawler:
             content[:8000].decode("utf-8", "replace")
         ):
             logger.warning("Blocked page (access denied), not saved: %s", final_url)
+            self.http.note_pressure(final_url, "Access Denied page", cooldown=True)
+            if item.url not in self._block_retried:
+                # Wait out the cool-down (done inside http.get) and try once more.
+                self._block_retried.add(item.url)
+                return self._process(item)
             self.failures.add(final_url, "access denied page")
-            self.http.note_pressure(final_url, "Access Denied page")
             return [], 0, False, final_url
 
+        render_failed = False
+        if self.js_enabled and self._needs_render(parsed):
+            rendered = self._render_with_playwright(final_url)
+            if rendered:
+                try:
+                    parsed = self.parser.parse(rendered, final_url)
+                except Exception as exc:
+                    logger.debug("Parse of rendered HTML failed for %s: %s", final_url, exc)
+                # The rendered page can itself be a WAF block page.
+                if self._is_blocked_page(parsed):
+                    logger.warning(
+                        "Blocked page (access denied) after rendering, not saved: %s",
+                        final_url,
+                    )
+                    self.failures.add(final_url, "access denied page")
+                    return [], 0, False, final_url
+            else:
+                render_failed = True
+
+        if is_internal(final_url, self.site.host):
+            self.categories.learn_nav(parsed.nav_entries)
         if item.link_only or (
             self.external_only and is_internal(final_url, self.site.host)
         ):
@@ -4894,25 +5422,6 @@ class Crawler:
                 final_url,
             )
 
-        render_failed = False
-        if self.js_enabled and self._needs_render(parsed):
-            rendered = self._render_with_playwright(final_url)
-            if rendered:
-                try:
-                    parsed = self.parser.parse(rendered, final_url)
-                except Exception as exc:
-                    logger.debug("Parse of rendered HTML failed for %s: %s", final_url, exc)
-                # The rendered page can itself be a WAF block page.
-                if self._is_blocked_page(parsed):
-                    logger.warning(
-                        "Blocked page (access denied) after rendering, not saved: %s",
-                        final_url,
-                    )
-                    self.failures.add(final_url, "access denied page")
-                    return [], 0, False, final_url
-            else:
-                render_failed = True
-
         # Never present a content-less page as a successful scrape without a
         # trace: count it, log it and flag the record.
         if not (parsed.title or "").strip() and len((parsed.text or "").strip()) < 50:
@@ -4927,7 +5436,8 @@ class Crawler:
         # Try to turn any remaining Hindi/Tamil/... text into English.  If the
         # translation service is unavailable the page is still stored with its
         # original text -- no page is ever skipped for its language.
-        self._translate_page(parsed, final_url)
+        if self.parser.collect_text:
+            self._translate_page(parsed, final_url)
 
         external_page = not is_internal(final_url, self.site.host)
         if external_page:
@@ -4938,7 +5448,6 @@ class Crawler:
             section = urlsplit(final_url).hostname or "external"
             page_id = url_to_prid(final_url)
         else:
-            self.categories.learn_nav(parsed.nav_entries)
             if self._wants_service_page(final_url):
                 # Real HTML copy of an API-harvested service row.
                 category = self.categories.resolve(SERVICE_PAGES_CATEGORY)
@@ -4951,6 +5460,8 @@ class Crawler:
                 # detected primary/categories can still be Hindi on a mixed
                 # site; translate them before they become folder names.
                 primary = self._translate_label(match.primary)
+                if self.category_complete and item.category_hint and item.category_hint.lower() != "uncategorized":
+                    primary = item.category_hint
                 category = self.categories.resolve(primary)
                 match_categories = [
                     self._translate_label(name) for name in match.categories
@@ -4958,15 +5469,13 @@ class Crawler:
                 section = self._translate_label(match.section)
                 page_id = url_to_prid(final_url)
 
+        if not self.parser.collect_text:
+            parsed.text = parsed.original_text = ""
         fields = content_fields(parsed)
         fingerprint = content_fingerprint(fields)
-        refresh_target = self._refresh_targets.get(item.url) if item.refresh else None
         force_kinds: set[str] = set()
         if item.refresh and self.refresh_media:
             force_kinds = {"image", "pdf", "document", "audio", "video"}
-            if refresh_target is not None and refresh_target.content_hash == fingerprint:
-                # Page text/links did not change, so only re-verify documents.
-                force_kinds.discard("image")
 
         media = self._download_all(
             parsed, category, page_id, final_url, force_kinds=force_kinds
@@ -4983,13 +5492,14 @@ class Crawler:
             "category": category.display,
             "categories": match_categories,
             "section": section,
-            "image_url": [url for url, _ in parsed.images],
+            "image_url": [url for url, _ in parsed.images if self._selected("image", url) and self._image_format_allowed(url)],
             "image_paths": media["images"],
-            "pdf_files": list(parsed.pdfs),
+            "pdf_files": [u for u in parsed.pdfs if self._selected("pdf", u)],
             "pdf_paths": media["pdfs"],
-            "audio_files": list(parsed.audios),
+            "pdf_names": media["pdf_names"],
+            "audio_files": [u for u in parsed.audios if self._selected("audio", u)],
             "audio_paths": media["audio"],
-            "video_files": list(parsed.videos),
+            "video_files": [u for u in parsed.videos if self._selected("video", u)],
             "video_paths": media["video"],
             "links": parsed.links,
             "language": parsed.language,
@@ -4997,10 +5507,11 @@ class Crawler:
             "content_hash": fingerprint,
             "last_checked": collected_at,
             # Additional fields required by the extraction spec:
-            "image_alts": [alt for _, alt in parsed.images],
+            "image_alts": [alt for u, alt in parsed.images if self._selected("image", u) and self._image_format_allowed(u)],
             "pdf_text_paths": media["pdf_text"],
-            "document_files": list(parsed.documents),
+            "document_files": [u for u in parsed.documents if self._selected("document", u)],
             "document_paths": media["documents"],
+            "document_names": media["document_names"],
         }
         if render_failed:
             record["render_failed"] = True
@@ -5013,6 +5524,22 @@ class Crawler:
             if parsed.original_text:
                 record["original_text"] = parsed.original_text
         if item.refresh:
+            # A partial re-check must not clear fields collected by an earlier
+            # run. Storage merges the selected fields into the existing row.
+            if not self.parser.collect_text:
+                record.pop("text", None)
+            if not self.parser.hyperlinks and not self.parser.buttons:
+                record.pop("links", None)
+            for kind, keys in {
+                "image": ("image_url", "image_paths", "image_alts"),
+                "pdf": ("pdf_files", "pdf_paths", "pdf_names", "pdf_text_paths"),
+                "audio": ("audio_files", "audio_paths"),
+                "video": ("video_files", "video_paths"),
+                "document": ("document_files", "document_paths", "document_names"),
+            }.items():
+                if not self.media_enabled or (self.media_kinds is not None and kind not in self.media_kinds):
+                    for key in keys:
+                        record.pop(key, None)
             self._handle_refresh(item, record, category.folder, fields)
         else:
             appended = self.storage.append(record, category.folder)
@@ -5031,7 +5558,7 @@ class Crawler:
             self._page_links(
                 parsed,
                 final_url,
-                category.display,
+                item.category_hint if external_page else category.display,
                 depth=item.depth,
                 external=external_page,
                 internal_depth=item.internal_depth,
@@ -5064,9 +5591,9 @@ class Crawler:
                         prid = str(record.get("prid") or "")
                         if not url or not prid or prid in seen_prids:
                             continue
-                        if folder == "services" or str(
-                            record.get("category") or ""
-                        ).strip().lower() == "services":
+                        if not is_internal(url, self.site.host) and not self.follow_external:
+                            continue
+                        if record.get("service_id") and folder == "services":
                             skipped_services += 1
                             continue
                         if classify_media(url) or url_suffix(url) in NON_HTML_EXT:
@@ -5192,7 +5719,7 @@ class Crawler:
             logger.warning("Refresh: could not rewrite record for %s", item.url)
             return
 
-        if target.folder and target.folder != folder:
+        if target.folder and (target.folder != folder or target.prid != record["prid"]):
             self.storage.remove(target.prid, target.folder)
             logger.info(
                 "Refresh: %s moved from %s to %s", item.url, target.folder, folder
@@ -5733,7 +6260,7 @@ class Crawler:
                     len(pending), len(visited), pages_done,
                 )
             elif same_start:
-                if not incremental:
+                if not incremental and not self.refresh_existing:
                     logger.info("Previous crawl already complete for %s.", seed_url)
                     self._summary(0, interrupted=False)
                     return
@@ -5782,13 +6309,15 @@ class Crawler:
         if self.refresh_existing:
             targets = self._load_refresh_targets()
             self._refresh_targets = {target.url: target for target in targets}
-            if targets and not restored:
+            queued_refresh = {i.url for i in pending if i.refresh}
+            targets = [target for target in targets if target.url not in queued_refresh]
+            if targets:
                 for target in reversed(targets):
                     pending.appendleft(
                         QueueItem(
                             url=target.url,
                             kind="page",
-                            refresh=True,
+                            refresh=True, category_hint=target.folder,
                             depth=0,
                             external=not is_internal(target.url, self.site.host),
                         )
@@ -5820,7 +6349,7 @@ class Crawler:
                     "(no media downloads, no duplicate records).",
                     len(hub_urls),
                 )
-            discovered = 0 if self.drain_only else self._seed_from_history(
+            discovered = 0 if self.drain_only or not self.parser.hyperlinks else self._seed_from_history(
                 pending, visited
             )
             if discovered:
@@ -5886,7 +6415,9 @@ class Crawler:
                         )
                         if limit > 0 and pages_done + inflight_pages >= limit:
                             break
-                        item = self._next_pending(pending, self.internal_first)
+                        item = self._next_pending(pending, bool(inflight))
+                        if item is None:
+                            break
                         queued_urls.discard(item.url)
                         if not item.url or item.url in self._failed_urls:
                             continue
@@ -6141,9 +6672,18 @@ def _launch_render_browser(pw):
     raise RuntimeError("no browser could be started (" + ", ".join(errors) + ")")
 
 
+# ----------------------------------------------------------------------
 def render_html_to_stdout(url: str, timeout_ms: int,
-                          proxy: Optional[str] = None) -> int:
-    """Render a JS-heavy page with Playwright and write UTF-8 HTML to stdout."""
+                          proxy: Optional[str] = None, buttons: bool = True) -> int:
+    """Render a JS-heavy page with Playwright and write UTF-8 HTML to stdout.
+
+    Comprehensively interacts with the page to reveal ALL hidden content:
+    - Clicks View/Show/Load/Expand/See More buttons and links
+    - Expands accordions, tabs, dropdowns, details/summary
+    - Scrolls to trigger lazy loading and infinite scroll
+    - Works for ANY website - finds elements by behavior patterns, not specific classes
+    - Reveals PDFs, documents, images, audio, video, tables, lists behind interactions
+    """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -6157,6 +6697,7 @@ def render_html_to_stdout(url: str, timeout_ms: int,
             browser = _launch_render_browser(pw)
             try:
                 context = browser.new_context(
+                    service_workers="block",
                     # A normal desktop UA is required: the real browsers send
                     # "HeadlessChrome/..." by default and some WAFs block that.
                     user_agent=DEFAULT_USER_AGENT,
@@ -6165,35 +6706,8 @@ def render_html_to_stdout(url: str, timeout_ms: int,
                     locale="en-US",
                     proxy=playwright_proxy(proxy),
                 )
-                # Hide the automation flag that bot checks look for.
-                context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', "
-                    "{get: () => undefined});"
-                )
                 page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-                try:
-                    page.wait_for_load_state(
-                        "networkidle", timeout=min(15000, timeout_ms)
-                    )
-                except Exception:
-                    pass
-                # Client-rendered apps paint after the first HTML arrives, so
-                # wait until the body actually has text instead of sleeping a
-                # fixed amount and hoping for the best.
-                deadline = time.monotonic() + max(5.0, timeout_ms / 1000.0)
-                while time.monotonic() < deadline:
-                    try:
-                        length = page.evaluate(
-                            "document.body ? document.body.innerText.trim().length : 0"
-                        )
-                    except Exception:
-                        length = 0
-                    if length >= 200:
-                        break
-                    page.wait_for_timeout(400)
-                page.wait_for_timeout(500)
-                html = page.content()
+                html = navigation.explore(page, url, timeout_ms, buttons, RobotsGate(DEFAULT_USER_AGENT).allowed)
             finally:
                 browser.close()
     except Exception as exc:  # pragma: no cover - depends on browser runtime
@@ -6374,6 +6888,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    for option in ("buttons", "hyperlinks", "text"):
+        parser.add_argument("--" + option, action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--formats", action="append", default=[], metavar="KIND:EXT,EXT")
     parser.add_argument("--url", help="Start URL, e.g. https://www.india.gov.in/")
     parser.add_argument(
         "--root-dir", default=DEFAULT_ROOT_DIR,
@@ -6570,6 +7087,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--category-complete", action=argparse.BooleanOptionalAction, default=True,
+        help=(
+            "Complete each category fully before moving to the next: exhaust "
+            "all pages within a category (following every link/button) before "
+            "starting another category. Ensures deep category scraping like "
+            "'Documents' with pagination and sub-pages."
+        ),
+    )
+    parser.add_argument(
         "--include-service-pages", action="store_true",
         help=(
             "Also fetch the india.gov.in /services/details/... pages as real "
@@ -6698,7 +7224,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return render_html_to_stdout(
             args.render_html,
             max(10000, args.render_timeout * 1000),
-            proxy=args.proxy[0] if args.proxy else None,
+            proxy=args.proxy[0] if args.proxy else None, buttons=args.buttons,
         )
     if not args.url:
         if args.india_services:
@@ -6720,7 +7246,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     external_only = bool(args.external_only)
     follow_external = bool(args.follow_external) or external_only
     external_max_pages = max(0, int(args.external_max_pages))
-    max_depth = max(1, int(args.max_depth))
+    max_depth = max(0, int(args.max_depth))
     max_internal_depth = max(0, int(args.internal_depth))
     follow_service_links = args.follow_service_links
     if follow_service_links is None:
@@ -6844,6 +7370,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "follow_service_links": follow_service_links,
         "internal_first": bool(args.internal_first),
         "include_service_pages": bool(args.include_service_pages),
+        "category_complete": bool(args.category_complete),
         "drain_only": bool(args.drain_only),
         "india_services": bool(args.india_services),
         "india_services_limit": max(0, int(args.india_services_limit)),
@@ -7031,6 +7558,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     html_parser = Parser(site.host)
+    html_parser.buttons, html_parser.hyperlinks, html_parser.collect_text = args.buttons, args.hyperlinks, args.text
     downloader = Downloader(
         http=http,
         site=site,
@@ -7087,6 +7615,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_internal_depth=max_internal_depth,
         external_only=external_only,
         follow_service_links=follow_service_links,
+        category_complete=args.category_complete,
         internal_first=bool(args.internal_first),
         include_service_pages=bool(args.include_service_pages),
         drain_only=bool(args.drain_only),
@@ -7098,6 +7627,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         prefer_english=not bool(args.no_language_switch),
         translate=not bool(args.no_translate),
     )
+
+    for spec in args.formats:
+        kind, _, extensions = spec.partition(":")
+        crawler.formats[kind] = set(extensions.lower().split(","))
 
     def _handle_sigint(signum: int, frame: Any) -> None:
         if stop_event.is_set():

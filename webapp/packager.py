@@ -413,9 +413,11 @@ def _overall_record(record: dict, text_on: bool) -> dict:
         "website_name": _website_name(record.get("source_url", "")),
         "image_url": record.get("image_url") or [],
         "pdf_files": record.get("pdf_files") or [],
+        "pdf_names": record.get("pdf_names") or [],
         "audio_files": record.get("audio_files") or [],
         "video_files": record.get("video_files") or [],
         "document_files": record.get("document_files") or [],
+        "document_names": record.get("document_names") or [],
         "language": record.get("language", ""),
         "collected_at": record.get("collected_at", ""),
     }

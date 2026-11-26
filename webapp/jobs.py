@@ -16,6 +16,13 @@ import packager
 import paths
 import runner
 
+# Rename tools live in the project root, next to scraper.py.
+ROOT = paths.ROOT
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import cleanup_originals  # noqa: E402
+import rename_downloads  # noqa: E402
+
 
 # How many websites may be crawled at the same time.  Each crawl keeps its own
 # delay/rate limiter, so this is a machine/network safety cap rather than a
@@ -372,6 +379,9 @@ class JobManager:
                 **(job.get("stats") or {}),
                 "resumed_at": utc_now(),
             }
+            # Resume first renames everything already downloaded, then the
+            # crawler continues with the new naming rule for new downloads.
+            job["auto_rename"] = True
         return self.start(job_id)
 
     def restart(self, job_id: str) -> dict:
@@ -431,6 +441,54 @@ class JobManager:
         if job.get("kind") == "live":
             return site / "live" / job["id"]
         return site
+
+    def _auto_rename(self, job: dict, site: Path,
+                     stop_event: threading.Event) -> None:
+        """On resume, rename saved downloads before the crawler continues."""
+        if not job.pop("auto_rename", False):
+            return
+        if job.get("kind") != "scrape":
+            return
+        categories = site / "categories"
+        if not categories.is_dir():
+            return
+
+        log_path = Path(job.get("log") or (site / "logs" / "webapp.log"))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def log(message: str) -> None:
+            line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} AUTO-RENAME {message}\n"
+            with log_path.open("a", encoding="utf-8", errors="replace") as handle:
+                handle.write(line)
+            print(line, end="")
+
+        log("Starting automatic topic/fallback rename before resume")
+        rename_stats = rename_downloads.rename_target(
+            categories, apply=True, sample=0, log=log
+        )
+        if stop_event.is_set():
+            raise RuntimeError("Stopped during automatic rename")
+        log(f"Renamed JSON document paths: {rename_stats['changes']}")
+
+        cleanup_stats = cleanup_originals.cleanup_target(
+            categories, apply=True, sample=0, log=log
+        )
+        if stop_event.is_set():
+            raise RuntimeError("Stopped during duplicate cleanup")
+        log(f"Deleted verified duplicate originals: {cleanup_stats['deleted']}")
+
+        with self._lock:
+            job["stats"] = {
+                **(job.get("stats") or {}),
+                "auto_rename": {
+                    "renamed_paths": rename_stats["changes"],
+                    "new_copies": rename_stats["applied_new_files"],
+                    "deleted_duplicates": cleanup_stats["deleted"],
+                    "kept_without_copy": cleanup_stats["kept_without_copy"],
+                    "at": utc_now(),
+                },
+            }
+        self._save()
 
     def _run(self, job_id: str, stop_event: threading.Event) -> None:
         job = self._jobs.get(job_id)
@@ -498,6 +556,7 @@ class JobManager:
 
     def _run_once(self, job: dict, site: Path, config: dict,
                   stop_event: threading.Event, date_window) -> dict:
+        self._auto_rename(job, site, stop_event)
         run = runner.ScrapeRun(job["url"], config, site, Path(job["log"]))
         with self._lock:
             self._runs[job["id"]] = run

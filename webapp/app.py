@@ -72,6 +72,7 @@ def config():
             "max_file_mb": 250,
             "external_max_pages": 0,
             "live_interval_min": 30,
+            "category_complete": True,
         },
         "disk": {"free": usage.free, "total": usage.total},
         "proxies": paths.proxy_settings(),

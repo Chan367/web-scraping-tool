@@ -2,12 +2,14 @@
 (() => {
   "use strict";
 
-  const ORDER = ["text", "image", "pdf", "audio", "video", "documents"];
+  const ORDER = ["text", "hyperlinks", "buttons", "image", "pdf", "audio", "video", "documents"];
   const ICONS = {
+    hyperlinks: "↗", buttons: "▣",
     text: "📄", image: "🖼️", pdf: "📕",
     audio: "🎵", video: "🎬", documents: "📊",
   };
   const LABELS = {
+    hyperlinks: "Follow hyperlinks", buttons: "Explore interactive controls",
     text: "Text", image: "Images", pdf: "PDF",
     audio: "Audio", video: "Video", documents: "Other documents",
   };
@@ -92,7 +94,7 @@
       head.append(name, sw);
       card.append(head);
 
-      if (kind !== "text") {
+      if (formats[kind]) {
         const chips = document.createElement("div");
         chips.className = "chips";
         (formats[kind] || []).forEach((fmt) => {
@@ -113,7 +115,8 @@
       } else {
         const note = document.createElement("p");
         note.className = "hint";
-        note.textContent = "Page body. Off = text left out of the JSON; links are still kept.";
+        note.textContent = ({text: "Save page body text.", hyperlinks: "Follow links and pagination.",
+          buttons: "Discover destinations and content behind controls."})[kind];
         card.append(note);
       }
 
@@ -206,6 +209,15 @@
       container.append(wrap);
     });
 
+    // Category scheduling applies to all scopes.
+    const catWrap = document.createElement("div");
+    catWrap.innerHTML = `<label class="field-label">Category crawl mode</label>
+      <label class="check">
+        <input type="checkbox" data-limit="category_complete" ${defaults.category_complete ? "checked" : ""}>
+        Complete each category fully before moving to the next
+      </label>`;
+    container.append(catWrap);
+
     const net = document.createElement("div");
     net.className = "proxy-job";
     net.innerHTML = `<label class="field-label">Proxy for this job (optional)</label>
@@ -258,7 +270,7 @@
     $$(".type-card", container).forEach((card) => {
       const kind = card.dataset.kind;
       const on = $("input", card).checked;
-      if (kind === "text") {
+      if (["text", "hyperlinks", "buttons"].includes(kind)) {
         out[kind] = on;
       } else {
         out[kind] = {
@@ -285,8 +297,12 @@
   function collectLimits(container) {
     const out = {};
     $$("[data-limit]", container).forEach((inp) => {
-      const v = parseFloat(inp.value);
-      out[inp.dataset.limit] = Number.isFinite(v) ? v : 0;
+      if (inp.type === "checkbox") {
+        out[inp.dataset.limit] = inp.checked;
+      } else {
+        const v = parseFloat(inp.value);
+        out[inp.dataset.limit] = Number.isFinite(v) ? v : 0;
+      }
     });
     const list = $("[data-proxy-list]", container);
     const mode = $("[data-proxy-mode]", container);
@@ -1135,8 +1151,8 @@
     }
     const mediaOn = ORDER.filter((k) => k !== "text")
       .some((k) => config.types[k] && config.types[k].on);
-    if (!config.types.text && !mediaOn) {
-      toast("Turn on at least one category (text or a file type).", true);
+    if (!config.types.text && !config.types.buttons && !config.types.hyperlinks && !mediaOn) {
+      toast("Turn on at least one What to Collect option.", true);
       return;
     }
 

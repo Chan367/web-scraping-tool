@@ -134,6 +134,11 @@ not committed to GitHub, so each user starts with a clean job list.
 5. Set advanced limits if needed (max pages, depth, delay, workers, file size)
 6. Click **Start scrape**
 
+PDFs and other documents are saved with the table's **Topic** text. If there is
+no Topic column, the page title + original file name is used. Duplicate names
+get `-1`, `-2`, and so on. Pressing **Resume** on a stopped job also renames the
+files it already downloaded before continuing.
+
 A new URL creates its own folder:
 
 ```text
@@ -302,6 +307,22 @@ the JSON record plus downloaded media are the deliverable.
 - **Proxy test fails.** Check the format `scheme://user:pass@IP:PORT`, whether
   the proxy allows your target port, and whether the credentials are correct.
 - **Port 5000 is busy.** Set `PORT=8080` before starting the app.
+- **The website blocks / bans the crawl (HTTP 403, 429, 503 or an "Access Denied"
+  page).** The crawler now handles this on its own: it pauses *all* workers
+  (30 s, then 60 s, 120 s ... up to 15 min, or the server's `Retry-After`),
+  slows the delay down, and retries the page afterwards instead of dropping it.
+  Look for `Block suspected ... Pausing ALL requests` in the log. A single
+  forbidden page (403 while other pages still load) is skipped without pausing.
+  If bans keep coming back:
+  - raise **Delay** (2-3 s) and lower **Workers** (1-2) in Advanced;
+  - the web app never uses a delay below `0.5` s (`SCRAPER_MIN_DELAY`, set `0` to
+    turn the floor off);
+  - run from your own computer / home or office connection - cloud servers'
+    IPs are blocked by most government sites;
+  - add proxies (section 5) as a last resort.
+- **`ModuleNotFoundError: translator` / `tqdm`.** You are not running from the
+  project folder or did not install the requirements. Run
+  `pip install -r requirements.txt` and start with `python webapp/app.py`.
 
 ---
 
@@ -309,6 +330,8 @@ the JSON record plus downloaded media are the deliverable.
 
 ```text
 scraper.py              main crawler / renderer / repair engine
+rename_downloads.py     topic-based file renaming (used by Resume)
+cleanup_originals.py    removes verified duplicate originals after renaming
 translator.py           translation helper
 requirements.txt        Python dependencies
 start_webapp.bat        one-click Windows launcher
@@ -325,3 +348,29 @@ webapp/
 
 Runtime data, scraped websites, virtual environments and proxy credentials are
 excluded by `.gitignore`.
+
+## Navigation, collection, and re-checks
+
+Internal mode stays on the starting site. External mode walks that site to
+discover off-site destinations but saves only external results. Full mode saves
+both. Internal depth and external hop depth are separate limits; zero means no
+depth limit. With **Complete each category** enabled, the scheduler waits for
+the active category's workers, their downloads, and newly queued children.
+
+**Follow hyperlinks** and **Explore interactive controls** can be switched
+independently of body text and file downloads. `navigation.py` discovers
+declared routes, pagination and document viewers, and uses Chromium for
+controls that reveal additional content. Browser discovery is bounded by the
+render budget, timeout and interaction limit. It skips form submission and
+cross-origin subresources; a page that depends on them may yield fewer results.
+
+**Resume** restores queued work. **Re-check Stored Pages** additionally selects
+existing category records by age and count, compares their content and links,
+and follows newly discovered children. File verification uses saved ETag or
+Last-Modified validators when available. Without validators the server must
+send the bytes for comparison. Source URLs remain URLs; document paths and
+display filenames are stored separately.
+
+Run the offline regression sites (requires dependencies and a Playwright Chromium
+installation) with `python tests/test_crawl.py -v`. They use temporary output
+directories, two local hostnames, and the actual scraper CLI.

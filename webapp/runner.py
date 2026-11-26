@@ -15,6 +15,23 @@ import paths
 CREATE_GROUP = 0x00000200 if os.name == "nt" else 0
 
 
+# Safety floor for the delay between requests.  Most government WAFs ban an IP
+# that sends more than a couple of requests per second, which is the usual reason
+# a crawl "gets blocked" from the web app.  Override with SCRAPER_MIN_DELAY (0 = off).
+try:
+    MIN_DELAY = max(0.0, float(os.environ.get("SCRAPER_MIN_DELAY", "0.5")))
+except ValueError:
+    MIN_DELAY = 0.5
+
+
+def effective_delay(limits: dict) -> float:
+    try:
+        value = float(limits.get("delay", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(value, MIN_DELAY)
+
+
 def _scraper_env() -> dict:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
@@ -158,7 +175,7 @@ def build_command(url: str, config: dict, seed_file: Path | None = None,
         sys.executable, "-u", str(paths.SCRAPER),
         "--url", url,
         "--root-dir", str(root_dir or paths.SCRAPED_DIR),
-        "--delay", str(float(limits.get("delay", 1.0))),
+        "--delay", str(effective_delay(limits)),
         "--workers", str(int(limits.get("workers", 4))),
         "--max-pages", str(int(limits.get("max_pages", 0) or 0)),
         "--max-file-mb", str(float(limits.get("max_file_mb", 250) or 250)),
@@ -178,17 +195,20 @@ def build_command(url: str, config: dict, seed_file: Path | None = None,
     legacy_overview = bool(modes.get("overview")) and scope == "internal"
 
     if scope == "full":
-        depth = int(limits.get("max_depth", 0) or 0) or 50
+        depth = int(limits.get("max_depth", 0) or 0)
         ext_pages = int(limits.get("external_max_pages", 0) or 0)
         cmd += ["--follow-external", "--external-max-pages", str(ext_pages),
                 "--max-depth", str(depth)]
     elif scope == "external":
-        depth = int(limits.get("max_depth", 0) or 0) or 50
+        depth = int(limits.get("max_depth", 0) or 0)
         ext_pages = int(limits.get("external_max_pages", 0) or 0)
         cmd += ["--external-only", "--follow-external",
                 "--external-max-pages", str(ext_pages), "--max-depth", str(depth)]
     else:
-        cmd += ["--max-depth", str(int(limits.get("max_depth", 3) or 3))]
+        # Internal mode: default to UNLIMITED depth (0 = no limit) so it crawls
+        # the entire site including deep category pages. User can still override.
+        internal_max_depth = int(limits.get("max_depth", 0) or 0)
+        cmd += ["--max-depth", str(internal_max_depth)]
 
     # How far inside the site to walk: 0 = whole site.  In external mode this
     # is how much of the site is checked for off-site links.  Legacy overview
@@ -197,6 +217,8 @@ def build_command(url: str, config: dict, seed_file: Path | None = None,
         internal_depth = int(limits.get("internal_depth", 0) or 0)
         if internal_depth > 0:
             cmd += ["--internal-depth", str(internal_depth)]
+        # Also pass category-depth flag for category-complete crawling
+        cmd.append("--category-complete" if limits.get("category_complete", True) else "--no-category-complete")
 
     if legacy_overview and seed_file is not None:
         cmd += ["--seed-file", str(seed_file), "--drain-only"]
@@ -215,6 +237,18 @@ def build_command(url: str, config: dict, seed_file: Path | None = None,
     # either way, so a text-only run still records the PDF/audio/video URLs.
     on = {k for k in ("image", "pdf", "audio", "video", "documents")
           if _is_on(types.get(k))}
+    for key in ("buttons", "hyperlinks", "text"):
+        if not _is_on(types.get(key, True)):
+            cmd.append("--no-" + key)
+    for key in list(on):
+        entry = types[key]
+        if isinstance(entry, dict) and "formats" in entry:
+            extensions = entry["formats"]
+            if not extensions:
+                on.remove(key)
+            else:
+                kind = "document" if key == "documents" else key
+                cmd.extend(["--formats", kind + ":" + ",".join(extensions)])
     if not on:
         cmd.append("--no-media")
     else:

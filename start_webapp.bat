@@ -1,13 +1,12 @@
 @echo off
-setlocal
 cd /d "%~dp0"
-set PYTHONIOENCODING=utf-8
-set PYTHONUNBUFFERED=1
-echo Starting the scraping web app...
-python "%~dp0webapp\app.py"
-if errorlevel 1 (
-  echo.
-  echo The app stopped with an error. Press any key to close.
-  pause >nul
+if not exist .venv (
+    python -m venv .venv
+    call .venv\Scripts\activate
+    pip install -r requirements.txt
+    python -m playwright install chromium
+) else (
+    call .venv\Scripts\activate
 )
-endlocal
+python webapp\app.py
+pause

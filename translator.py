@@ -1,188 +1,166 @@
-"""Best-effort English translation for scraped non-English pages.
+"""Best-effort English translation helper used by scraper.py.
 
-The crawler uses this to turn Hindi/Tamil/... page text into English when a
-site has no English version.  Translation is optional: if the request fails,
-the caller keeps the original text, so a page is never lost.
+Uses Google's public translate endpoint through ``requests``.  Nothing here may
+ever stop a crawl: every method returns an empty result on failure so the
+caller keeps the original text.  Results are cached in a small JSON file.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
-try:  # requests is already a scraper dependency
+try:
     import requests
-except Exception:  # pragma: no cover - requests is normally available
-    requests = None  # type: ignore[assignment]
+except Exception:  # pragma: no cover
+    requests = None  # type: ignore
 
-GOOGLE_URL = "https://translate.googleapis.com/translate_a/single"
-MAX_CHUNK = 4000
-MAX_CONSECUTIVE_FAILURES = 6
+logger = logging.getLogger("sitecrawler.translator")
 
-
-def split_for_translation(text: str, limit: int = MAX_CHUNK) -> list[str]:
-    """Split text into newline-preserving chunks no longer than *limit*."""
-    text = text or ""
-    if not text:
-        return []
-    chunks: list[str] = []
-    current = ""
-    for block in text.split("\n"):
-        while len(block) > limit:
-            cut = block.rfind(" ", 0, limit)
-            if cut < limit // 2:
-                cut = limit
-            piece, block = block[:cut], block[cut:]
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.append(piece)
-        if not block:
-            if current:
-                current += "\n"
-            continue
-        if current and len(current) + 1 + len(block) > limit:
-            chunks.append(current)
-            current = block
-        else:
-            current = f"{current}\n{block}" if current else block
-    if current:
-        chunks.append(current)
-    return chunks or [text]
+ENDPOINT = "https://translate.googleapis.com/translate_a/single"
+CHUNK_CHARS = 3500          # keep every request comfortably small
+MAX_CONSECUTIVE_FAILURES = 6  # then pause translating for a while
+PAUSE_SECONDS = 120.0
+LINE_SEP = "\n@@@\n"
 
 
 class EnglishTranslator:
-    """Thread-safe, cached translator with a hard fallback to the source text."""
-
-    def __init__(self, cache_path: Path | None = None, timeout: float = 20.0,
-                 min_interval: float = 0.2) -> None:
+    def __init__(self, cache_path: Optional[Path] = None, timeout: float = 20.0) -> None:
         self.cache_path = Path(cache_path) if cache_path else None
-        self.timeout = max(5.0, float(timeout or 20.0))
-        self.min_interval = max(0.0, float(min_interval or 0.0))
-        self._lock = threading.RLock()
-        self._last_call = 0.0
+        self.timeout = timeout
+        self.available = requests is not None
+        self._lock = threading.Lock()
         self._cache: dict[str, str] = {}
-        self._consecutive_failures = 0
-        self.disabled = False
-        self._session = requests.Session() if requests is not None else None
-        if self._session is not None:
-            self._session.headers.update({
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-            })
-        self._load_cache()
+        self._dirty = 0
+        self._failures = 0
+        self._paused_until = 0.0
+        self._load()
 
-    @property
-    def available(self) -> bool:
-        return self._session is not None and not self.disabled
-
-    # -- cache -------------------------------------------------------------
-    def _load_cache(self) -> None:
+    # ------------------------------------------------------------ cache ---
+    def _load(self) -> None:
         if not self.cache_path or not self.cache_path.is_file():
             return
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._cache = {str(k): str(v) for k, v in data.items()}
         except Exception:
-            return
-        if isinstance(data, dict):
-            self._cache = {
-                str(key): str(value) for key, value in data.items()
-                if isinstance(value, str)
-            }
+            self._cache = {}
 
-    def _save_cache(self) -> None:
+    def _save(self) -> None:
         if not self.cache_path:
             return
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.cache_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(self._cache, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(json.dumps(self._cache, ensure_ascii=False), encoding="utf-8")
             tmp.replace(self.cache_path)
-        except OSError:
+        except Exception:
             pass
 
-    # -- public API --------------------------------------------------------
-    def translate(self, text: str) -> str | None:
-        """Return *text* in English, or ``None`` when translation failed."""
-        text = text or ""
-        if not text.strip():
+    @staticmethod
+    def _key(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()
+
+    # ---------------------------------------------------------- network ---
+    def _request(self, text: str) -> str:
+        if requests is None:
             return ""
-        if not self.available:
-            return None
-        key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        now = time.monotonic()
         with self._lock:
-            cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-
-        pieces: list[str] = []
-        for chunk in split_for_translation(text):
-            translated = self._translate_chunk(chunk)
-            if translated is None:
-                return None
-            pieces.append(translated)
-        result = "\n".join(pieces)
-        with self._lock:
-            self._cache[key] = result
-            self._save_cache()
-        return result
-
-    def translate_lines(self, lines: list[str]) -> list[str] | None:
-        """Translate many short labels (menus) in one request."""
-        if not lines:
-            return []
-        if not any(line.strip() for line in lines):
-            return list(lines)
-        joined = "\n".join(line or "" for line in lines)
-        translated = self.translate(joined)
-        if translated is None:
-            return None
-        out = translated.split("\n")
-        # Google can merge/split lines; only trust an exact line count.
-        if len(out) != len(lines):
-            return None
-        return out
-
-    # -- one request -------------------------------------------------------
-    def _translate_chunk(self, chunk: str) -> str | None:
-        if not chunk.strip():
-            return chunk
-        with self._lock:
-            wait = self.min_interval - (time.monotonic() - self._last_call)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.monotonic()
+            if now < self._paused_until:
+                return ""
+        for attempt in range(3):
             try:
-                response = self._session.get(  # type: ignore[union-attr]
-                    GOOGLE_URL,
-                    params={
-                        "client": "gtx",
-                        "sl": "auto",
-                        "tl": "en",
-                        "dt": "t",
-                        "q": chunk,
-                    },
+                resp = requests.post(
+                    ENDPOINT,
+                    params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t"},
+                    data={"q": text},
+                    headers={"User-Agent": "Mozilla/5.0"},
                     timeout=self.timeout,
                 )
-                response.raise_for_status()
-                data = response.json()
-                segments = data[0] or []
-                translated = "".join(
-                    segment[0] for segment in segments
-                    if segment and segment[0]
-                )
-                if not translated.strip():
-                    raise ValueError("empty translation")
-                self._consecutive_failures = 0
-                return translated
-            except Exception:
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    self.disabled = True
-                return None
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    out = "".join(part[0] for part in (payload[0] or []) if part and part[0])
+                    with self._lock:
+                        self._failures = 0
+                    return out
+                if resp.status_code in (429, 503):
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            except Exception as exc:
+                logger.debug("translate request failed: %s", exc)
+                time.sleep(1 + attempt)
+        with self._lock:
+            self._failures += 1
+            if self._failures >= MAX_CONSECUTIVE_FAILURES:
+                self._paused_until = time.monotonic() + PAUSE_SECONDS
+                self._failures = 0
+                logger.warning("Translation service failing; pausing translation for %.0fs",
+                               PAUSE_SECONDS)
+        return ""
+
+    @staticmethod
+    def _split(text: str, limit: int) -> list[str]:
+        parts, cur, size = [], [], 0
+        for line in text.split("\n"):
+            while len(line) > limit:           # very long single line
+                if cur:
+                    parts.append("\n".join(cur)); cur, size = [], 0
+                parts.append(line[:limit]); line = line[limit:]
+            if size + len(line) + 1 > limit and cur:
+                parts.append("\n".join(cur)); cur, size = [], 0
+            cur.append(line); size += len(line) + 1
+        if cur:
+            parts.append("\n".join(cur))
+        return parts
+
+    # -------------------------------------------------------- public API ---
+    def translate(self, text: str) -> str:
+        """Return the English text, or ``""`` when translation failed."""
+        text = (text or "").strip()
+        if not text or not self.available:
+            return ""
+        key = self._key(text)
+        with self._lock:
+            hit = self._cache.get(key)
+        if hit:
+            return hit
+        pieces = []
+        for chunk in self._split(text, CHUNK_CHARS):
+            if not chunk.strip():
+                pieces.append(chunk)
+                continue
+            out = self._request(chunk)
+            if not out:
+                return ""            # all-or-nothing: keep original on failure
+            pieces.append(out)
+        result = "\n".join(pieces).strip()
+        if result:
+            with self._lock:
+                self._cache[key] = result
+                self._dirty += 1
+                if self._dirty >= 20:
+                    self._dirty = 0
+                    self._save()
+        return result
+
+    def translate_lines(self, lines: list[str]) -> list[str]:
+        """Translate short labels; returns ``[]`` on failure (caller keeps originals)."""
+        if not lines or not self.available:
+            return []
+        joined = LINE_SEP.join(l.replace("\n", " ") for l in lines)
+        out = self.translate(joined)
+        if not out:
+            return []
+        parts = [p.strip() for p in out.split("@@@")]
+        return parts if len(parts) == len(lines) else []
+
+    def flush(self) -> None:
+        with self._lock:
+            self._save()
