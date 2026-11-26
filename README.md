@@ -356,6 +356,9 @@ discover off-site destinations but saves only external results. Full mode saves
 both. Internal depth and external hop depth are separate limits; zero means no
 depth limit. With **Complete each category** enabled, the scheduler waits for
 the active category's workers, their downloads, and newly queued children.
+The log names each category as it starts. Category discovery uses real menu
+destinations (including nested menus and query routes) and headed lists in
+sections. Shared destinations are visited once, even if several menus link to them.
 
 `robots.txt` redirects are followed, so sites that move their policy file from
 `example.com/robots.txt` to `www.example.com/robots.txt` are not mistaken for
@@ -363,13 +366,21 @@ blocked origins. A missing or WAF-blocked (4xx) robots file means "no extra
 restrictions"; only a 5xx/unreachable file disables crawling for that origin.
 
 **Follow hyperlinks** and **Explore interactive controls** can be switched
-independently of body text and file downloads. `navigation.py` discovers
-declared routes, pagination and document viewers, and uses Chromium for
-controls that reveal additional content. Browser discovery is bounded by the
-render budget, timeout and interaction limit. It skips form submission and
+independently of body text and file downloads. `hyperlinks.py` reads links,
+pagination and embedded viewers; `navigation.py` discovers button routes and
+explores dynamic controls. `crawl_modes.py` defines the three traversal policies;
+`crawl_queue.py` schedules their categories. Browser discovery is bounded by
+the per-page timeout and the optional browser-rendered page budget (0 = no
+page-count cap). It skips form submission and
 cross-origin subresources; a page that depends on them may yield fewer results.
 
-**Resume** restores queued work. **Re-check Stored Pages** additionally selects
+**Follow navigation through previously saved pages** (on for web jobs, CLI
+`--rediscover`) traces links again from the starting page, including through
+known pages at any permitted depth. New pages are collected without duplicating
+existing records. Use **Re-check Stored Pages** to update existing page records
+and their attachments too.
+
+**Resume** restores queued work for the same crawl mode. **Re-check Stored Pages** selects
 existing category records by age and count, compares their content and links,
 and follows newly discovered children. File verification uses saved ETag or
 Last-Modified validators when available. Without validators the server must

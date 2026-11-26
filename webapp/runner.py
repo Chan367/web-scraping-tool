@@ -180,6 +180,7 @@ def build_command(url: str, config: dict, seed_file: Path | None = None,
         "--max-pages", str(int(limits.get("max_pages", 0) or 0)),
         "--max-file-mb", str(float(limits.get("max_file_mb", 250) or 250)),
         "--state-every", "5",
+        "--render-budget", str(max(0, int(limits.get("render_budget") or 0))),
         "--log-level", "INFO",
     ]
 
@@ -214,6 +215,8 @@ def build_command(url: str, config: dict, seed_file: Path | None = None,
     # is how much of the site is checked for off-site links.  Legacy overview
     # is fixed at one level and uses the seed file below.
     if not legacy_overview:
+        if limits.get("rediscover", True):
+            cmd.append("--rediscover")
         internal_depth = int(limits.get("internal_depth", 0) or 0)
         if internal_depth > 0:
             cmd += ["--internal-depth", str(internal_depth)]

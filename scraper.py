@@ -109,6 +109,8 @@ from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from tqdm import tqdm
 
 import navigation
+from crawl_modes import Depth, select_mode
+from crawl_queue import CrawlQueue
 from translator import EnglishTranslator
 
 try:  # optional: trust the same certificate authorities as the operating system
@@ -150,7 +152,6 @@ DEFAULT_USER_AGENT = (
 
 MAX_PATH_LEN = 250          # stay safely below Windows' 260-char limit
 MAX_TEXT_CHARS = 1_500_000
-MAX_LINKS_PER_PAGE = 5_000
 MAX_IMAGES_PER_PAGE = 1_000
 STATE_SAVE_EVERY = 10
 PDF_TEXT_LIMIT = 2_000_000
@@ -640,7 +641,7 @@ EXTERNAL_BLOCKED_HOSTS = (
 
 
 def normalize_url(url: str, base: Optional[str] = None) -> Optional[str]:
-    """Normalize a URL for dedupe: no fragment, no trailing slash, clean query.
+    """Normalize a URL for dedupe while preserving directory and query semantics.
 
     Returns ``None`` for non-HTTP(S) or invalid URLs.
     """
@@ -676,20 +677,16 @@ def normalize_url(url: str, base: Optional[str] = None) -> Optional[str]:
             netloc = host
         path = parts.path or "/"
         path = re.sub(r"/{2,}", "/", path)
-        if len(path) > 1:
-            path = path.rstrip("/") or "/"
         kept: list[tuple[str, str]] = []
-        seen_keys: set[str] = set()
         for key, val in parse_qsl(parts.query, keep_blank_values=True):
             low = key.lower()
             if low in DROP_QUERY_KEYS or any(low.startswith(p) for p in DROP_QUERY_PREFIXES):
                 continue
-            if low in seen_keys:
-                continue
-            seen_keys.add(low)
             kept.append((key, val))
         query = urlencode(kept, doseq=True)
-        return urlunsplit((scheme, netloc, path, query, ""))
+        # An SPA route is a separate document state; an ordinary #heading is not.
+        fragment = parts.fragment if parts.fragment.startswith(("/", "!/")) else ""
+        return urlunsplit((scheme, netloc, path, query, fragment))
     except Exception:
         return None
 
@@ -1725,7 +1722,7 @@ class SiteFolderManager:
         try:
             if self.source_path != target.resolve():
                 shutil.copy2(self.source_path, target)
-                for name in ("translator.py", "navigation.py"):
+                for name in ("translator.py", "navigation.py", "hyperlinks.py", "crawl_modes.py", "crawl_queue.py"):
                     shutil.copy2(self.source_path.with_name(name), target.with_name(name))
         except Exception as exc:  # pragma: no cover - non fatal
             logger.debug("Could not copy scraper source: %s", exc)
@@ -1940,32 +1937,31 @@ class CategoryManager:
         """Learn top-level menu paths from any crawled page."""
         with self._nav_lock:
             for path, display in entries:
-                path = (path or "").rstrip("/") or "/"
+                path = path or "/"
                 display = clean_ws(display, 70)
                 if path == "/" or len(display) < 2 or path in self._nav:
                     continue
                 if _looks_like_language_menu(display):
                     continue
-                if len(self._nav) >= 300:
-                    break
                 self._nav[path] = display
 
     def _nav_match(self, url: str) -> str:
         try:
-            path = urlsplit(url).path.rstrip("/") or "/"
+            parts = urlsplit(url)
+            path = parts.path.rstrip("/") or "/"
         except Exception:
             return ""
-        best_path = ""
-        best_display = ""
         with self._nav_lock:
-            items = list(self._nav.items())
-        for nav_path, display in items:
-            if nav_path == "/":
-                continue
-            if path == nav_path or path.startswith(nav_path + "/"):
-                if len(nav_path) > len(best_path):
-                    best_path, best_display = nav_path, display
-        return best_display
+            route = path + ("?" + parts.query if parts.query else "")
+            if parts.fragment and (label := self._nav.get(route + "#" + parts.fragment)):
+                return label
+            if parts.query and (label := self._nav.get(path + "?" + parts.query)):
+                return label
+            while path and path != "/":
+                if path in self._nav:
+                    return self._nav[path]
+                path = path.rpartition("/")[0]
+        return ""
 
     # -- detection --------------------------------------------------------
     @staticmethod
@@ -2072,6 +2068,18 @@ class ParsedPage:
     source_language: str = ""
     original_title: str = ""
     original_text: str = ""
+
+    def retain_discovery(self, earlier):
+        """Hydration may remove server-rendered links and attachments."""
+        links = {link["url"]: link for link in earlier.links}
+        links.update((link["url"], link) for link in self.links)
+        self.links = list(links.values())
+        images = dict(earlier.images)
+        images.update(self.images)
+        self.images = list(images.items())
+        for key in ("pdfs", "documents", "audios", "videos", "nav_entries"):
+            setattr(self, key, list(dict.fromkeys(getattr(earlier, key) + getattr(self, key))))
+        self.download_names = {**earlier.download_names, **self.download_names}
 
 
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
@@ -2367,7 +2375,7 @@ class Parser:
         base_url = (self._abs(base["href"], page_url) if base else None) or page_url
         parsed.title = self._extract_title(soup)
         parsed.breadcrumbs = self._extract_breadcrumbs(soup, parsed.title)
-        parsed.nav_entries = self._extract_nav_entries(soup, page_url)
+        parsed.nav_entries = self._extract_nav_entries(soup, base_url)
         parsed.nav_parent = self._extract_nav_parent(soup, page_url)
         parsed.download_names = extract_topic_download_names(soup, base_url)
         self._extract_links_and_media(soup, base_url, parsed)
@@ -2464,58 +2472,30 @@ class Parser:
     ) -> list[tuple[str, str]]:
         entries: list[tuple[str, str]] = []
         seen: set[str] = set()
-        containers: list[Tag] = []
-        for selector in self.NAV_SELECTORS:
-            for node in soup.select(selector):
-                if node not in containers:
-                    containers.append(node)
-        for container in containers:
-            top_lis = [li for li in container.find_all("li") if not li.find_parents("li")]
-            anchors: list[Tag] = []
-            if top_lis:
-                for li in top_lis:
-                    anchor = li.find("a", href=True)
-                    if anchor is not None:
-                        anchors.append(anchor)
-            if not anchors:
-                anchors = [
-                    a for a in container.find_all("a", href=True)
-                    if not a.find_parents("li")
-                ]
-            for anchor in anchors:
-                display = clean_ws(
-                    anchor.get_text(" ", strip=True) or anchor.get("title", ""), 70
-                )
+        selectors = (*self.NAV_SELECTORS, "header", "[role=menu]", "[role=menubar]")
+        groups = [(menu, "") for menu in soup.select(",".join(selectors))]
+        # Directory pages may use a heading and list for each section rather
+        # than a navigation landmark. Use only actual grouped destinations.
+        for listing in soup.select("section > ul, section > ol, [role=region] > ul"):
+            heading = listing.parent.find(re.compile("^h[1-6]$"), recursive=False)
+            label = listing.parent.get("aria-label") or (heading.get_text(" ", strip=True) if heading else "")
+            if label:
+                groups.append((listing, label))
+        for container, group_label in groups:
+            for raw, label in navigation.discover(container, self.hyperlinks, self.buttons):
+                display = clean_ws(group_label or label, 70)
                 if len(display) < 2 or display.lower() in HOME_WORDS:
                     continue
-                href = self._abs(anchor.get("href"), page_url)
+                href = self._abs(raw, page_url)
                 if not href or not is_internal(href, self.site_host):
                     continue
-                path = (urlsplit(href).path.rstrip("/") or "/")
+                parts = urlsplit(href)
+                path = parts.path.rstrip("/") or "/"
+                if parts.query:
+                    path += "?" + parts.query
+                if parts.fragment:
+                    path += "#" + parts.fragment
                 if path == "/" or path in seen or len(path) < 2:
-                    continue
-                seen.add(path)
-                entries.append((path, display))
-                if len(entries) >= 150:
-                    return entries
-
-        # Fallback for JS frameworks whose top-level menu items are buttons
-        # without hrefs but carry labels such as aria-label="Explore India Dropdown".
-        if len(entries) < 150:
-            label_re = re.compile(r"^(.+?)\s+(?:dropdown|menu)(?:\s+option)?$", re.I)
-            generic = {"all categories", "search", "search data", "close", "menu", "language"}
-            for node in soup.find_all(attrs={"aria-label": True}):
-                if node.name != "header" and node.find_parent("header") is None:
-                    continue
-                label = clean_ws(node.get("aria-label"), 70)
-                match = label_re.match(label)
-                if not match:
-                    continue
-                display = clean_ws(match.group(1), 70)
-                if len(display) < 2 or display.lower() in generic or display.lower() in HOME_WORDS:
-                    continue
-                path = "/" + re.sub(r"[^a-z0-9]+", "-", display.lower()).strip("-")
-                if path == "/" or path in seen:
                     continue
                 seen.add(path)
                 entries.append((path, display))
@@ -2682,7 +2662,7 @@ class Parser:
             if not absolute:
                 continue
             text = clean_ws(label, 300)
-            if absolute not in link_seen and len(link_seen) < MAX_LINKS_PER_PAGE:
+            if absolute not in link_seen:
                 link_seen.add(absolute)
                 parsed.links.append(
                     {
@@ -4436,11 +4416,13 @@ class StateStore:
         queue: Iterable[QueueItem],
         pages_done: int,
         completed: bool = False,
+        mode: str = "",
     ) -> None:
         payload = {
             "version": VERSION,
             "site_name": self.site_name,
             "start_url": self.start_url,
+            "mode": mode,
             "visited": sorted(set(visited)),
             "queue": [item.to_dict() for item in queue if item.url],
             "pages_done": pages_done,
@@ -4491,11 +4473,12 @@ class Crawler:
         js_enabled: bool = True,
         restart: bool = False,
         render_timeout: int = 60,
-        render_budget: int = 300,
+        render_budget: int = 0,
         honor_robots_delay: bool = True,
         incremental: bool = True,
         export_excel: bool = True,
         refresh_links: int = 25,
+        rediscover: bool = False,
         seed_file: Optional[str] = None,
         media_enabled: bool = True,
         download_images: bool = True,
@@ -4542,6 +4525,7 @@ class Crawler:
         # --restart turns every skip check off for this run.
         self.effective_incremental = bool(incremental) and not restart
         self.refresh_links = max(0, refresh_links)
+        self.rediscover = rediscover and not refresh_existing and not drain_only
         self.seed_file = seed_file
         self.media_enabled = media_enabled
         self.formats = {}
@@ -4569,6 +4553,7 @@ class Crawler:
         # External web scrap: internal pages are only used to find off-site
         # links; they are never saved and their media is never downloaded.
         self.external_only = bool(external_only)
+        self.mode = select_mode(self.follow_external, self.external_only)
         self.follow_service_links = bool(follow_service_links)
         self.drain_only = bool(drain_only)
         self.external_pages = 0
@@ -4585,7 +4570,6 @@ class Crawler:
         self._service_done: set[str] = set()
         self._service_lock = threading.Lock()
         # Category-complete: track which category we're currently exhausting
-        self._active_category: Optional[str] = None
         if self.include_service_pages:
             self._load_service_page_targets()
 
@@ -4627,7 +4611,7 @@ class Crawler:
         # Rendering runs in a subprocess, but only one at a time so several
         # worker threads cannot start several browsers at once.
         self._render_gate = threading.Semaphore(1)
-        self._render_budget = max(0, int(render_budget))
+        self._render_budget = int(render_budget) if render_budget > 0 else None
         self.render_failures = 0
         self.empty_pages = 0
         self._playwright_available = importlib.util.find_spec("playwright") is not None
@@ -4648,7 +4632,7 @@ class Crawler:
     def _save_snapshot(
         self,
         visited: set[str],
-        pending: deque[QueueItem],
+        pending: Iterable[QueueItem],
         inflight: dict[Any, QueueItem],
         pages_done: int,
         completed: bool = False,
@@ -4657,7 +4641,8 @@ class Crawler:
         queue_items = inflight_items + list(pending)
         visited_snapshot = set(visited) - {item.url for item in inflight_items}
         try:
-            self.state.save(visited_snapshot, queue_items, pages_done, completed)
+            self.state.save(visited_snapshot, queue_items, pages_done, completed,
+                            mode=self.mode.name)
             self.downloader.save_index()
             self.categories.write_index()
             self.index.save()
@@ -4874,12 +4859,13 @@ class Crawler:
 
     def _render_with_playwright(self, url: str) -> Optional[bytes]:
         with self._render_lock:
-            if self._render_budget <= 0:
+            if self._render_budget == 0:
                 logger.warning(
                     "JavaScript render budget used up; %s is saved as fetched.", url
                 )
                 return None
-            self._render_budget -= 1
+            if self._render_budget is not None:
+                self._render_budget -= 1
         script = str(Path(__file__).resolve())
         proxy = (self.http.proxy_pool.acquire()
                  if getattr(self.http, "proxy_pool", None) else None)
@@ -5013,24 +4999,6 @@ class Crawler:
         if added:
             logger.info("Queued %d service page(s) for a full HTML fetch.", added)
         return added
-
-    def _next_pending(self, pending, busy):
-        # Only the coordinator owns pending. In-flight workers may discover new
-        # children: wait for them before declaring their category exhausted.
-        if self.category_complete and self._active_category is not None:
-            for i, item in enumerate(pending):
-                if item.category_hint == self._active_category:
-                    del pending[i]
-                    return item
-            if busy:
-                return None
-        index = 0
-        if self.internal_first or self.category_complete:
-            index = next((i for i, item in enumerate(pending) if not item.external), 0)
-        item = pending[index]
-        del pending[index]
-        self._active_category = item.category_hint
-        return item
 
     # -- URL filtering ----------------------------------------------------
     def _is_other_language_url(self, url: str) -> bool:
@@ -5205,48 +5173,29 @@ class Crawler:
                 continue
 
             target_internal = is_internal(target, self.site.host)
-            if source_external:
-                # Already off-site: keep the crawl inside the same website.
-                if not self.follow_external or not same_site(target, final_url):
-                    continue
-                next_depth = depth + 1
-                if self.max_depth and next_depth > self.max_depth:
-                    continue
-                if not self._external_host_allowed(target):
-                    continue
-                next_external = True
-                hint = category_hint
-                next_internal = internal_depth
-            elif target_internal:
-                next_internal = internal_depth + 1
-                if self.max_internal_depth and next_internal > self.max_internal_depth:
-                    continue
-                next_depth = depth
-                next_external = False
-                hint = self.categories._nav_match(target) or (category_hint if category_hint.lower() != "uncategorized" else self.categories._segment_category(target)) or "uncategorized"
-            else:
-                if not self.follow_external:
-                    continue
-                if not self._external_host_allowed(target):
-                    continue
-                next_depth = depth + 1
-                if self.max_depth and next_depth > self.max_depth:
-                    continue
-                next_external = True
-                hint = category_hint
-                next_internal = internal_depth
-
-            if next_external and not self._claim_external_page(target):
+            child = self.mode.next_depth(
+                Depth(internal_depth, depth), source_internal=not source_external,
+                target_internal=target_internal, same_host=same_site(target, final_url),
+                internal_limit=self.max_internal_depth, external_limit=self.max_depth)
+            if child is None:
                 continue
+            if not target_internal and (
+                    not self._external_host_allowed(target) or not self._claim_external_page(target)):
+                continue
+            hint = category_hint
+            if target_internal:
+                if hint.lower() == "uncategorized":
+                    hint = self.categories._segment_category(target) or hint
+                hint = self.categories._nav_match(target) or hint
             seen_links.add(target)
             item = QueueItem(
                 url=target,
                 kind="page",
                 category_hint=hint,
                 referrer=final_url,
-                depth=next_depth,
-                external=next_external,
-                internal_depth=next_internal,
+                depth=child.external,
+                external=not target_internal,
+                internal_depth=child.internal,
                 display_name=parsed.download_names.get(target) or link.get("text") or parsed.title,
             )
 
@@ -5298,6 +5247,9 @@ class Crawler:
             return [], 0, False, ""
 
         final_url = normalize_url(response.url) or item.url
+        if (self.rediscover and self.effective_incremental and not item.refresh
+                and self.index.is_known(final_url)):
+            item.link_only = True
         if (
             self.effective_incremental
             and not item.link_only
@@ -5393,7 +5345,9 @@ class Crawler:
             rendered = self._render_with_playwright(final_url)
             if rendered:
                 try:
-                    parsed = self.parser.parse(rendered, final_url)
+                    rendered_page = self.parser.parse(rendered, final_url)
+                    rendered_page.retain_discovery(parsed)
+                    parsed = rendered_page
                 except Exception as exc:
                     logger.debug("Parse of rendered HTML failed for %s: %s", final_url, exc)
                 # The rendered page can itself be a WAF block page.
@@ -5409,9 +5363,7 @@ class Crawler:
 
         if is_internal(final_url, self.site.host):
             self.categories.learn_nav(parsed.nav_entries)
-        if item.link_only or (
-            self.external_only and is_internal(final_url, self.site.host)
-        ):
+        if item.link_only or not self.mode.saves_page(is_internal(final_url, self.site.host)):
             # link_only: cheap re-check of an already-scraped hub page.
             # external_only: an internal page is used only to find off-site
             # links; no internal record or media is stored.
@@ -5425,7 +5377,7 @@ class Crawler:
                     external=item.external,
                     internal_depth=item.internal_depth,
                 ),
-                0,
+                int(self.rediscover),
                 True,
                 final_url,
             )
@@ -6253,7 +6205,11 @@ class Crawler:
         if state_payload and not self.restart:
             same_start = normalize_url(state_payload.get("start_url", "")) == seed_url
             state_done = bool(state_payload.get("completed"))
-            if same_start and not state_done:
+            same_mode = state_payload.get("mode", self.mode.name) == self.mode.name
+            if same_start and not same_mode:
+                logger.info("Crawl mode changed to %s; discovering from the seed with existing records intact.",
+                            self.mode.name)
+            elif same_start and not state_done:
                 restored = True
                 visited = set(state_payload.get("visited") or [])
                 pending = deque(
@@ -6281,7 +6237,7 @@ class Crawler:
                     state_payload.get("start_url"), seed_url,
                 )
 
-        if incremental:
+        if incremental and not self.rediscover:
             # Never re-fetch anything already recorded, even when resuming.
             visited |= known_urls
 
@@ -6341,7 +6297,7 @@ class Crawler:
                     ),
                 )
 
-        if incremental:
+        if incremental and not self.rediscover:
             # A content refresh already re-reads the pages, so the cheap
             # hub link recheck would only duplicate work.
             hub_urls = [] if (self.refresh_existing or self.drain_only) else self._hub_urls(
@@ -6391,6 +6347,8 @@ class Crawler:
                 self.http.limiter.set_delay(effective)
 
         queued_urls: set[str] = {item.url for item in pending if item.url}
+        frontier = CrawlQueue(pending, self.category_complete, self.internal_first)
+        pending.clear()
         limit = self.max_pages
         total = limit if limit > 0 else None
         inflight: dict[Any, QueueItem] = {}
@@ -6414,16 +6372,16 @@ class Crawler:
                         break
 
                     # Dispatch work.
-                    while pending and len(inflight) < self.workers * 3:
+                    while frontier and len(inflight) < self.workers * 3:
                         if self.stop_event.is_set():
                             break
                         inflight_pages = sum(
                             1 for it in inflight.values()
-                            if it.kind == "page" and not it.link_only
+                            if it.kind == "page" and (self.rediscover or not it.link_only)
                         )
                         if limit > 0 and pages_done + inflight_pages >= limit:
                             break
-                        item = self._next_pending(pending, bool(inflight))
+                        item = frontier.take(bool(inflight))
                         if item is None:
                             break
                         queued_urls.discard(item.url)
@@ -6436,13 +6394,15 @@ class Crawler:
                             and not self._wants_service_page(item.url)
                         ):
                             continue
-                        if not item.link_only:
+                        if self.rediscover and item.kind == "page" and item.url in known_urls:
+                            item.link_only = True
+                        if self.rediscover or not item.link_only:
                             visited.add(item.url)
                         future = pool.submit(self._process, item)
                         inflight[future] = item
 
                     if not inflight:
-                        if not pending or self.stop_event.is_set():
+                        if not frontier or self.stop_event.is_set():
                             break
                         if limit > 0 and pages_done >= limit:
                             break
@@ -6482,20 +6442,20 @@ class Crawler:
                                 and new_item.url not in queued_urls
                                 and new_item.url not in self._failed_urls
                             ):
-                                pending.append(new_item)
+                                frontier.append(new_item)
                                 queued_urls.add(new_item.url)
 
                     if pages_done - last_saved_pages >= self.state_every:
-                        self._save_snapshot(visited, pending, inflight, pages_done)
+                        self._save_snapshot(visited, frontier, inflight, pages_done)
                         last_saved_pages = pages_done
         except KeyboardInterrupt:
             self._interrupted = True
             logger.warning("Interrupted by user; saving state...")
         finally:
             bar.close()
-            finished = not self._interrupted and not pending and not inflight
+            finished = not self._interrupted and not frontier and not inflight
             self._save_snapshot(
-                visited, pending, inflight, pages_done, completed=finished
+                visited, frontier, inflight, pages_done, completed=finished
             )
 
         self.start_failed = bool(
@@ -6945,7 +6905,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable the Playwright fallback for JavaScript-rendered pages",
     )
     parser.add_argument(
-        "--render-budget", type=int, default=300,
+        "--render-budget", type=int, default=0,
         help=(
             "Maximum number of JavaScript page renders per run "
             "(0 = unlimited). Rendering is serialised, one browser at a time."
@@ -6996,6 +6956,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "0 disables it"
         ),
     )
+    parser.add_argument("--rediscover", action="store_true",
+                        help="Follow navigation from the seed through stored pages as well as new pages")
     parser.add_argument(
         "--refresh-existing", action="store_true",
         help=(
@@ -7602,6 +7564,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         incremental=bool(args.incremental),
         export_excel=bool(args.excel),
         refresh_links=max(0, int(args.refresh_links)),
+        rediscover=args.rediscover,
         seed_file=args.seed_file,
         media_enabled=bool(args.media),
         download_images=bool(args.images),

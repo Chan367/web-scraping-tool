@@ -69,6 +69,7 @@ def config():
             "max_pages": 0,
             "max_depth": 0,
             "internal_depth": 0,
+            "render_budget": 0,
             "max_file_mb": 250,
             "external_max_pages": 0,
             "live_interval_min": 30,

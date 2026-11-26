@@ -21,6 +21,23 @@ class Site(BaseHTTPRequestHandler):
         self.server.requests.append((self.headers["Host"], path))
         offsite = f"http://localhost:{self.server.server_port}"
         pages = {
+            "/catalog": '<nav><ul><li><button>Sections</button><ul>'
+                        '<li><a href="/shelves">Archives</a></li>'
+                        '<li><a href="/shelves?group=B">Bulletins</a></li>'
+                        '</ul></li></ul></nav>',
+            "/shelves/": ''.join(f'<a href="item?n=1&n={i}">item {i}</a>'
+                                 for i in range(9)),
+            "/shelves?group=B": '<a href="/bulletin">Bulletin detail</a>',
+            "/bulletin": '',
+            "/switches": '<button id="a">A</button><button id="b">B</button>'
+                         '<script>for(const id of ["a","b"]) document.getElementById(id).onclick=()=>{'
+                         'location.href="/chosen/"+id;}</script>',
+            "/chosen/a": '', "/chosen/b": '',
+            "/app": '<nav><a href="#/library">Library</a></nav>'
+                    '<a id="original" href="/bulletin">Server link</a>'
+                    '<script>document.querySelector("#original").remove();'
+                    'if(location.hash==="#/library")document.write(\'<a href="/shelf">Shelf</a>\');</script>',
+            "/shelf": '',
             "/options": '<a href="/private">private</a><a href="/jump">jump</a>'
                         '<button data-url="/hidden">hidden</button><table><tr><th>विषय</th><th>File</th></tr>'
                         '<tr><td>Report</td><td><a href="/two.pdf">2</a></td></tr>'
@@ -48,6 +65,15 @@ class Site(BaseHTTPRequestHandler):
               };
             })</script><button>◎</button><section></section>''',
         }
+        if path == "/shelves":
+            self.send_response(301)
+            self.send_header("Location", "/shelves/")
+            self.end_headers()
+            return
+        if path.startswith("/shelves/item?") or path.startswith("/step/"):
+            level = int(path.rsplit("/", 1)[1]) if path.startswith("/step/") else 0
+            last = 8 if self.server.updated else 7
+            pages[path] = f'<a href="/step/{level + 1}">Next</a>' if level < last else ''
         if path == "/jump":
             self.send_response(302)
             self.send_header("Location", offsite + "/external")
@@ -142,6 +168,27 @@ class Crawl(unittest.TestCase):
         self.assertEqual({urlsplit(r["source_url"]).path for r in rows}, {"/external", "/external/deeper"})
         self.assertEqual(sum(len(r["pdf_paths"]) for r in rows), 1)
 
+    def test_web_full_after_limited_internal(self):
+        # Exercise the same command builder the Flask job runner calls.
+        sys.path.insert(0, str(ROOT / "webapp"))
+        try:
+            import runner
+        finally:
+            sys.path.pop(0)
+        self.crawl("--max-pages", "2")
+        cmd = runner.build_command(self.base + "/", {
+            "modes": {"full": True}, "limits": {"delay": 0.5, "workers": 3},
+            "types": {"text": True},
+        }, root_dir=Path(self.tmp.name))
+        result = subprocess.run(cmd + ["--no-js", "--no-excel", "--no-language-switch", "--no-translate"],
+                                capture_output=True, timeout=100)
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        rows = [json.loads(line) for path in Path(self.tmp.name).rglob("pages.jsonl")
+                for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(rows), 8)
+        self.assertEqual(len({row["source_url"] for row in rows}), 8)
+        self.assertTrue(any(row["source_url"].endswith("/external/deeper") for row in rows))
+
     def test_selections(self):
         rows = self.crawl("--no-text", "--no-hyperlinks", "--no-buttons",
                           "--formats", "document:xlsx", start="/options")
@@ -175,6 +222,35 @@ class Crawl(unittest.TestCase):
         rows = self.crawl("--max-pages", "2", start="/js", browser=True)
         self.assertTrue(any(r["pdf_paths"] for r in rows))
         self.assertIn("/viewer", [urlsplit(r["source_url"]).path for r in rows])
+
+    def test_deep_category_fanout(self):
+        rows = self.crawl("--follow-external", start="/catalog")
+        by_category = {}
+        for row in rows:
+            by_category.setdefault(row["category"], set()).add(row["source_url"].split(self.base, 1)[1])
+        self.assertEqual(by_category["Archives"], {"/shelves/"} |
+                         {f"/shelves/item?n=1&n={i}" for i in range(9)} |
+                         {f"/step/{i}" for i in range(1, 8)})
+        self.assertEqual(by_category["Bulletins"], {"/shelves?group=B", "/bulletin"})
+        paths = [p for _, p in self.server.requests]
+        self.assertLess(paths.index("/step/7"), paths.index("/shelves?group=B"))
+        self.server.updated = True
+        rows = self.crawl("--rediscover", "--follow-external", start="/catalog")
+        self.assertIn("/step/8", {urlsplit(row["source_url"]).path for row in rows})
+
+    @property
+    def base(self):
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    def test_sibling_navigation_buttons(self):
+        rows = self.crawl(start="/switches", browser=True)
+        self.assertEqual({urlsplit(row["source_url"]).path for row in rows},
+                         {"/switches", "/chosen/a", "/chosen/b"})
+
+    def test_client_route_and_server_links(self):
+        rows = self.crawl("--render-budget", "0", start="/app", browser=True)
+        self.assertEqual({row["source_url"][len(self.base):] for row in rows},
+                         {"/app", "/app#/library", "/shelf", "/bulletin"})
 
     def test_external_popup(self):
         rows = self.crawl("--external-only", "--follow-external", start="/popup", browser=True)

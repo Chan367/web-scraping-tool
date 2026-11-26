@@ -195,6 +195,7 @@
     const fields = [
       ["max_pages", "Max pages (0 = all)", defaults.max_pages],
       ["internal_depth", "Pages deep (0 = whole site)", defaults.internal_depth],
+      ["render_budget", "Browser-rendered pages (0 = no limit)", defaults.render_budget || 0],
       ["max_depth", "External depth (0 = no limit)", defaults.max_depth, "external"],
       ["external_max_pages", "Max external pages (0 = no limit)", defaults.external_max_pages, "external"],
       ["delay", "Delay between requests (s)", defaults.delay],
@@ -217,6 +218,11 @@
         Complete each category fully before moving to the next
       </label>`;
     container.append(catWrap);
+    const rediscover = document.createElement("label");
+    rediscover.className = "check";
+    rediscover.innerHTML = `<input type="checkbox" data-limit="rediscover" checked>
+      Follow navigation through previously saved pages`;
+    container.append(rediscover);
 
     const net = document.createElement("div");
     net.className = "proxy-job";
