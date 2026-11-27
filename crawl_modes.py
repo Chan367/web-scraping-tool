@@ -1,7 +1,7 @@
 """Page selection policies. Discovery, queueing and downloads share one coordinator."""
 from dataclasses import dataclass
 
-
+   
 @dataclass(frozen=True)
 class Depth:
     internal: int = 0
