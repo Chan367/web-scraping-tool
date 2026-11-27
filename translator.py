@@ -5,7 +5,7 @@ ever stop a crawl: every method returns an empty result on failure so the
 caller keeps the original text.  Results are cached in a small JSON file.
 """
 from __future__ import annotations
-
+   
 import hashlib
 import json
 import logging
